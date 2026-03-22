@@ -33,17 +33,14 @@ export default function DatasetList({ projectId, datasets, onDeleted }: DatasetL
   async function handleDownload(e: React.MouseEvent, datasetId: string) {
     e.stopPropagation();
     try {
-      const response = await fetch(
-        `${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/api/projects/${projectId}/datasets/${datasetId}/download`,
-        { method: 'GET' }
+      const data = await api.get<{ download_url: string }>(
+        `/api/projects/${projectId}/datasets/${datasetId}/download`
       );
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
+      a.href = data.download_url;
       a.download = `dataset-${datasetId}.csv`;
+      a.rel = 'noopener noreferrer';
       a.click();
-      URL.revokeObjectURL(url);
     } catch {
       // Download failed silently
     }

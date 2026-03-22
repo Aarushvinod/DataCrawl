@@ -5,43 +5,27 @@ State is persisted to Firestore; the frontend sees updates via onSnapshot.
 """
 
 import asyncio
-import json
 import uuid
 import traceback
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, AIMessage
-from google.cloud.firestore_v1 import ArrayUnion
 
 from app.services.firebase import get_firestore_client, get_storage_bucket
+from app.services.run_control import (
+    RunCancelledError,
+    append_message,
+    clear_run_control,
+    ensure_cancel_event,
+    ensure_not_cancelled,
+    get_run_doc,
+    get_run_ref,
+    register_task,
+    unregister_task,
+    update_run,
+)
 from agents.graph import build_graph
 from agents.state import DataCrawlState
-
-
-def _get_run_ref(user_id: str, project_id: str, run_id: str):
-    db = get_firestore_client()
-    return (
-        db.collection("users").document(user_id)
-        .collection("projects").document(project_id)
-        .collection("runs").document(run_id)
-    )
-
-
-def _update_run(run_ref, updates: dict):
-    """Update the Firestore run document."""
-    try:
-        run_ref.update(updates)
-    except Exception as e:
-        print(f"Failed to update run: {e}")
-
-
-def _is_killed(run_ref) -> bool:
-    """Check if the run has been killed by the user."""
-    try:
-        doc = run_ref.get()
-        return doc.to_dict().get("status") == "killed"
-    except Exception:
-        return False
 
 
 def _has_checkpoints(run_ref) -> bool:
@@ -60,6 +44,7 @@ async def run_planning_phase(
     initial_message: str,
     budget: float,
     is_continuation: bool = False,
+    resume_updates: dict | None = None,
 ):
     """Run the orchestrator in planning mode.
 
@@ -68,7 +53,11 @@ async def run_planning_phase(
     """
     try:
         db = get_firestore_client()
-        run_ref = _get_run_ref(user_id, project_id, run_id)
+        run_ref = get_run_ref(user_id, project_id, run_id)
+        ensure_cancel_event(run_id)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            register_task(run_id, current_task)
 
         graph = build_graph(db, user_id, project_id)
         config = {"configurable": {"thread_id": run_id}}
@@ -77,12 +66,16 @@ async def run_planning_phase(
         if is_continuation and has_checkpoint:
             # Resume existing conversation — invoke with the new message
             result = await graph.ainvoke(
-                {"messages": [HumanMessage(content=initial_message)]},
+                {
+                    "messages": [HumanMessage(content=initial_message)],
+                    **(resume_updates or {}),
+                },
                 config=config,
             )
         else:
             # New run — start fresh
             initial_state = {
+                "run_id": run_id,
                 "messages": [HumanMessage(content=initial_message)],
                 "plan": None,
                 "plan_approved": False,
@@ -94,88 +87,164 @@ async def run_planning_phase(
                 "agent_logs": [],
                 "current_agent": "",
                 "current_task": None,
+                "pending_input_request": None,
+                "pending_paid_approval": None,
+                "budget_analysis": None,
+                "plan_version": 0,
+                "active_plan_step_id": None,
+                "retry_counters": {},
+                "source_research": [],
+                "last_script_task": None,
+                "last_validation_result": None,
+                "completed_steps": 0,
+                "total_steps": 0,
                 "status": "planning",
                 "error": None,
             }
             result = await graph.ainvoke(initial_state, config=config)
 
-        # Extract the latest AI message for display
-        ai_messages = []
+        await ensure_not_cancelled(user_id, project_id, run_id)
+
+        latest_ai_message = None
         for msg in result.get("messages", []):
             if isinstance(msg, AIMessage) and msg.content:
-                ai_messages.append({"role": "assistant", "content": msg.content})
+                latest_ai_message = msg.content
 
-        # Update Firestore with the result
         updates = {}
-        if ai_messages:
-            updates["messages_display"] = ArrayUnion(ai_messages)
+        if latest_ai_message:
+            doc = get_run_doc(user_id, project_id, run_id)
+            displayed = doc.get("messages_display", [])
+            if not displayed or displayed[-1].get("content") != latest_ai_message:
+                append_message(user_id, project_id, run_id, "assistant", latest_ai_message)
 
-        if result.get("agent_logs"):
-            updates["agent_logs"] = ArrayUnion(result["agent_logs"])
+        shared_updates = {
+            "current_agent": result.get("current_agent", ""),
+            "current_task": result.get("current_task"),
+            "pending_input_request": result.get("pending_input_request"),
+            "pending_paid_approval": result.get("pending_paid_approval"),
+            "budget_analysis": result.get("budget_analysis"),
+            "plan_version": result.get("plan_version", 0),
+            "active_plan_step_id": result.get("active_plan_step_id"),
+            "retry_counters": result.get("retry_counters", {}),
+        }
 
-        # Check if a plan was presented
-        if result.get("plan") and not result.get("plan_approved"):
+        if result.get("status") == "awaiting_user_input":
+            updates.update(shared_updates)
+            updates["status"] = "awaiting_user_input"
+            updates["current_phase"] = "awaiting_user_input"
+            updates["progress_percent"] = 35
+        elif result.get("plan") and not result.get("plan_approved"):
             updates["status"] = "awaiting_approval"
+            updates["current_phase"] = "awaiting_approval"
             updates["plan"] = result["plan"]
+            updates["total_steps"] = len(result["plan"].get("steps", []))
+            updates["completed_steps"] = 0
+            updates["progress_percent"] = 45
+            updates.update(shared_updates)
         elif result.get("plan_approved"):
             updates["status"] = "approved"
+            updates["current_phase"] = "execution"
             updates["plan"] = result["plan"]
+            updates["progress_percent"] = 50
+            updates.update(shared_updates)
 
         if updates:
-            _update_run(run_ref, updates)
+            update_run(user_id, project_id, run_id, updates)
 
+    except RunCancelledError:
+        update_run(user_id, project_id, run_id, {
+            "status": "killed",
+            "current_phase": "killed",
+            "error": "Run cancelled by user",
+        })
+        append_message(user_id, project_id, run_id, "assistant", "Run cancelled.")
     except Exception as e:
         traceback.print_exc()
-        run_ref = _get_run_ref(user_id, project_id, run_id)
-        _update_run(run_ref, {
+        update_run(user_id, project_id, run_id, {
             "status": "failed",
-            "agent_logs": ArrayUnion([{
-                "agent": "system",
-                "action": "error",
-                "status": "failed",
-                "summary": f"Planning failed: {str(e)}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }]),
-            "messages_display": ArrayUnion([
-                {"role": "assistant", "content": f"An error occurred during planning: {str(e)}"}
-            ]),
+            "current_phase": "failed",
+            "error": str(e),
         })
+        append_message(user_id, project_id, run_id, "assistant", f"An error occurred during planning: {str(e)}")
+    finally:
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            unregister_task(run_id, current_task)
+        if get_run_doc(user_id, project_id, run_id).get("status") in ("completed", "failed", "killed"):
+            clear_run_control(run_id)
 
 
 async def run_execution_phase(
     user_id: str,
     project_id: str,
     run_id: str,
+    resume_message: str | None = None,
+    resume_updates: dict | None = None,
 ):
     """Run the full execution phase after plan approval.
 
     Resumes the LangGraph from the approved state and runs all plan steps.
     Each agent step is logged to Firestore for real-time frontend updates.
     """
-    run_ref = _get_run_ref(user_id, project_id, run_id)
+    run_ref = get_run_ref(user_id, project_id, run_id)
 
     try:
         db = get_firestore_client()
-        _update_run(run_ref, {"status": "running"})
+        ensure_cancel_event(run_id)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            register_task(run_id, current_task)
+        update_run(user_id, project_id, run_id, {
+            "status": "running",
+            "current_phase": "execution",
+            "progress_percent": 50,
+            "error": None,
+        })
 
         graph = build_graph(db, user_id, project_id)
         config = {"configurable": {"thread_id": run_id}}
 
-        # Resume the graph with plan approval
+        await ensure_not_cancelled(user_id, project_id, run_id)
+
         result = await graph.ainvoke(
             {
-                "messages": [HumanMessage(content="Plan approved. Execute all steps.")],
+                "run_id": run_id,
+                "messages": [HumanMessage(content=resume_message or "Plan approved. Execute all steps.")],
                 "plan_approved": True,
                 "status": "running",
+                "current_phase": "execution",
+                **(resume_updates or {}),
             },
             config=config,
         )
 
-        # Check kill switch
-        if _is_killed(run_ref):
+        await ensure_not_cancelled(user_id, project_id, run_id)
+
+        latest_ai_message = None
+        for msg in result.get("messages", []):
+            if isinstance(msg, AIMessage) and msg.content:
+                latest_ai_message = msg.content
+        if latest_ai_message:
+            doc = get_run_doc(user_id, project_id, run_id)
+            displayed = doc.get("messages_display", [])
+            if not displayed or displayed[-1].get("content") != latest_ai_message:
+                append_message(user_id, project_id, run_id, "assistant", latest_ai_message)
+
+        if result.get("status") in ("awaiting_user_input", "awaiting_paid_approval"):
+            update_run(user_id, project_id, run_id, {
+                "status": result.get("status"),
+                "current_phase": result.get("current_phase", result.get("status")),
+                "current_agent": result.get("current_agent", ""),
+                "current_task": result.get("current_task"),
+                "pending_input_request": result.get("pending_input_request"),
+                "pending_paid_approval": result.get("pending_paid_approval"),
+                "budget_analysis": result.get("budget_analysis"),
+                "active_plan_step_id": result.get("active_plan_step_id"),
+                "retry_counters": result.get("retry_counters", {}),
+                "error": None,
+            })
             return
 
-        # Process results — save datasets to Firebase Storage
         datasets = result.get("datasets", [])
         bucket = get_storage_bucket()
         saved_datasets = []
@@ -213,28 +282,34 @@ async def run_execution_phase(
                 datasets_col.document(dataset_id).set(dataset_doc)
                 saved_datasets.append(dataset_id)
 
-        # Mark run as completed
-        _update_run(run_ref, {
+        update_run(user_id, project_id, run_id, {
             "status": "completed",
+            "current_phase": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
-            "agent_logs": ArrayUnion(result.get("agent_logs", [])),
-            "messages_display": ArrayUnion([
-                {"role": "assistant", "content": f"Execution complete. {len(saved_datasets)} dataset(s) saved."}
-            ]),
+            "current_agent": "",
+            "current_task": None,
+            "progress_percent": 100,
         })
+        append_message(user_id, project_id, run_id, "assistant", f"Execution complete. {len(saved_datasets)} dataset(s) saved.")
 
+    except RunCancelledError:
+        update_run(user_id, project_id, run_id, {
+            "status": "killed",
+            "current_phase": "killed",
+            "error": "Run cancelled by user",
+        })
+        append_message(user_id, project_id, run_id, "assistant", "Run cancelled.")
     except Exception as e:
         traceback.print_exc()
-        _update_run(run_ref, {
+        update_run(user_id, project_id, run_id, {
             "status": "failed",
-            "agent_logs": ArrayUnion([{
-                "agent": "system",
-                "action": "error",
-                "status": "failed",
-                "summary": f"Execution failed: {str(e)}",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }]),
-            "messages_display": ArrayUnion([
-                {"role": "assistant", "content": f"Execution failed: {str(e)}"}
-            ]),
+            "current_phase": "failed",
+            "error": str(e),
         })
+        append_message(user_id, project_id, run_id, "assistant", f"Execution failed: {str(e)}")
+    finally:
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            unregister_task(run_id, current_task)
+        if get_run_doc(user_id, project_id, run_id).get("status") in ("completed", "failed", "killed"):
+            clear_run_control(run_id)

@@ -16,8 +16,9 @@ def init_firebase():
         # Falls back to Application Default Credentials
         cred = credentials.ApplicationDefault()
 
+    bucket_name = settings.FIREBASE_STORAGE_BUCKET or f"{settings.FIREBASE_PROJECT_ID}.firebasestorage.app"
     _app = firebase_admin.initialize_app(cred, {
-        "storageBucket": f"{settings.FIREBASE_PROJECT_ID}.firebasestorage.app",
+        "storageBucket": bucket_name,
     })
 
 

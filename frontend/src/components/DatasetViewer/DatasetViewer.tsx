@@ -53,17 +53,14 @@ export default function DatasetViewer() {
   async function handleDownload() {
     if (!projectId || !datasetId) return;
     try {
-      const response = await fetch(
-        `${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/api/projects/${projectId}/datasets/${datasetId}/download`,
-        { method: 'GET' }
+      const data = await api.get<{ download_url: string }>(
+        `/api/projects/${projectId}/datasets/${datasetId}/download`
       );
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
+      a.href = data.download_url;
       a.download = `${dataset?.name || 'dataset'}.csv`;
+      a.rel = 'noopener noreferrer';
       a.click();
-      URL.revokeObjectURL(url);
     } catch {
       // Download failed
     }

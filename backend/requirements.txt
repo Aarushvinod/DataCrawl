@@ -27,4 +27,6 @@ browser-use==0.1.40
 playwright==1.49.0
 
 # Data processing
+requests==2.32.3
+beautifulsoup4==4.12.3
 pandas==2.2.3

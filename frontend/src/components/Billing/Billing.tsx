@@ -167,6 +167,9 @@ export default function Billing() {
 
       {/* Payment Methods */}
       <div className="card" style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 16 }}>
+          Saved Stripe payment methods are used when a paid financial-data provider requires explicit approval during an agent run.
+        </div>
         <div
           style={{
             display: 'flex',

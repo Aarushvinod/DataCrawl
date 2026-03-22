@@ -1,22 +1,19 @@
-"""Orchestrator Agent - Gemini 3.1 Pro Preview via Google Gen AI SDK.
+"""Orchestrator Agent using Google Gemini function calling."""
 
-This is the user-facing conversational agent. It:
-1. Chats with the user to understand dataset requirements
-2. Generates a structured data collection plan
-3. Presents the plan for user approval (via LangGraph interrupt)
-4. Coordinates sub-agent execution after approval
-"""
+from __future__ import annotations
 
+import base64
+import json
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from google import genai
 from google.genai import types
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.types import interrupt
 
 from app.config import settings
+from app.services.run_control import finish_agent_log, run_cancellable, start_agent_log
+from agents.llm_utils import LLMServiceError
 from agents.state import DataCrawlState
 
 ORCHESTRATOR_MODEL = "gemini-3.1-pro-preview"
@@ -32,93 +29,196 @@ TOOL_RESPONSE_MAP = {
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the DataCrawl Orchestrator, an AI that helps users create datasets for financial analysis, trading, research, and machine learning.
 
 ## Your Role
-You converse with the user to understand their dataset needs, then create a structured plan for data collection. After the user approves the plan, you coordinate execution by calling the appropriate sub-agents.
+You ONLY handle financial-data requests. Your job is to discover where the requested financial data can be found on the internet, determine whether it is feasible within budget, and build a complete execution plan that can run with minimal human intervention after approval.
+
+If the request is not about financial data, do not attempt to satisfy it. Briefly explain that DataCrawl currently only supports financial data collection and ask the user to restate their request in financial-data terms.
+
+Your plan must be detailed and executable. Do not present vague tool-only plans.
 
 ## Available Sub-Agents (use these as tool calls)
-1. **compliance** - Checks legality of scraping a source, verifies budget. MUST be called before any scraping or payment action.
-2. **script_writer** - Generates Python scraping scripts for APIs and websites.
-3. **web_crawler** - Autonomous browser agent that can navigate pages, click buttons, fill forms, and extract data from dynamic websites.
-4. **synthetic_generator** - Generates synthetic/simulated data when real data is unavailable.
-5. **normalizer** - Transforms and normalizes raw data into a target schema.
-6. **validator** - Validates dataset quality, completeness, and coverage.
+1. **compliance** - Reviews financial-data source legality, licensing, budget fit, and pricing provenance. Paid providers must be justified against free alternatives.
+2. **script_writer** - Implements precise extraction scripts. It is not responsible for source discovery.
+3. **web_crawler** - Performs browser reconnaissance, account setup, API key retrieval, and browser-based extraction when APIs are unavailable.
+4. **synthetic_generator** - Generates synthetic data ONLY when the plan explicitly allows this fallback.
+5. **normalizer** - Applies schema cleanup only. It must not invent semantic financial data.
+6. **validator** - Strictly verifies schema, expected row-count range, and extraction quality. If validation fails, use its repair instructions to revise the script before asking the user for help.
 
 ## Planning Phase
-During planning, ask the user about:
-- What data they need (type, schema, columns)
-- Data sources (specific sites/APIs, or let you decide)
-- Volume (how many rows, time range)
-- Output format (CSV, JSON, Parquet)
-- Budget for external data costs (the budget does NOT include LLM costs, only external data purchases)
+During planning, gather or infer:
+- the exact financial dataset requested
+- the exact fields/columns required
+- the exact time range and granularity
+- the exact entities/symbols required
+- the target row count and acceptable row-count range
+- which sources can realistically satisfy the request
+- all account, API-key, and payment prerequisites
+- the exact external-cost budget and whether it is sufficient
 
-Then generate a plan as a JSON object with this structure:
+You MAY call compliance and web_crawler during planning to verify source feasibility, auth requirements, pricing, and live provider details before proposing the plan.
+
+When you have enough information, generate a detailed plan JSON with this structure:
 {
   "plan_id": "<uuid>",
   "description": "<one-line summary>",
-  "steps": [
-    {"step": 1, "agent": "<agent_name>", "action": "<action>", "params": {...}},
-    ...
+  "financial_request_summary": "<user request restated precisely>",
+  "output_contract": {
+    "format": "csv",
+    "required_columns": [],
+    "optional_columns": [],
+    "row_count_target": 0,
+    "row_count_range": {"min": 0, "max": 0},
+    "time_range": "",
+    "granularity": "",
+    "symbols_or_entities": []
+  },
+  "source_strategy": [
+    {
+      "provider": "",
+      "source_mode": "api_code|web_scraping",
+      "endpoint_or_url": "",
+      "why_selected": "",
+      "requires_account": false,
+      "requires_api_key": false,
+      "requires_paid_plan": false,
+      "free_vs_paid_rank": "preferred_free|fallback_free|last_resort_paid"
+    }
   ],
-  "estimated_cost": 0.00,
-  "data_sources": ["<source1>", ...],
-  "output_format": "csv"
+  "budget_analysis": {
+    "budget_total": 0,
+    "estimated_total_cost": 0,
+    "within_budget": true,
+    "line_items": [
+      {
+        "provider": "",
+        "kind": "",
+        "estimated_cost": 0,
+        "calculation": "",
+        "pricing_source": ""
+      }
+    ]
+  },
+  "user_inputs_required": [],
+  "steps": [
+    {
+      "id": "",
+      "agent": "",
+      "goal": "",
+      "inputs": {},
+      "expected_outputs": [],
+      "success_criteria": [],
+      "fallback_step_ids": [],
+      "estimated_cost": 0
+    }
+  ],
+  "risks_and_fallbacks": [],
+  "synthetic_data_usage": {"allowed": false, "reason": ""},
+  "approval_gate_summary": {"approvable": true, "reason": ""}
 }
 
-When you have enough information, present the plan and ask for approval.
+If any paid provider may be necessary, include:
+{
+  "paid_execution_notice": {
+    "may_require_paid_approval": true,
+    "candidate_paid_providers": [],
+    "expected_price_range": "",
+    "manual_checkout_required": true,
+    "supported_payment_methods": ["stripe"]
+  }
+}
+
+When you have enough information, call `present_plan`.
 
 ## Execution Phase
-After plan approval, execute each step by calling the corresponding sub-agent tool. Always call compliance before scraping. After data collection, always normalize then validate.
+If `plan_approved` is true, do not present a new plan unless the user explicitly asked for replanning or a paid step was declined. Continue execution from the approved plan, one step at a time.
 
-## Budget Rules
-- The user's budget covers ONLY external data costs (API fees, paid content), NOT LLM inference costs.
-- Always check budget via the compliance agent before any paid action.
-- If budget is $0, only use free sources.
+During execution:
+- Use free sources whenever possible. Paid providers are a last resort.
+- Before any paid provider signup or purchase step, request an explicit paid approval.
+- If validator failure occurs, retry script_writer with structured repair context up to two times before pausing for user help.
+- If a service needs account info, API keys, OTPs, or credentials, request structured user input and pause.
 
 ## Important
 - Be concise and helpful.
 - For financial data, suggest well-known free sources first: Yahoo Finance, Alpha Vantage (free tier), FRED, SEC EDGAR.
-- Always include compliance, normalization, and validation steps in plans.
+- Prefer API/code sourcing over web scraping whenever a usable API or structured endpoint exists.
+- Do not recommend a paid provider unless you can explain why free options are insufficient.
+- If a plan is over budget, say so before presenting it as approvable and show the budget calculations and sources.
+- The user should be able to see where each budget calculation came from.
+- Paid provider steps require a second approval during execution with the exact live price at that moment.
+- Always include compliance and validation in plans. Include normalization only if it is actually needed to satisfy the schema contract.
 """
 
 
 def _build_tools() -> list[types.Tool]:
-    """Define the function-calling tools for routing to sub-agents."""
     declarations = [
         types.FunctionDeclaration(
             name="call_compliance",
-            description="Check legality and budget for a data source or action",
+            description="Review a financial-data source for cost, licensing, auth requirements, and compliance. Prefer free options. Paid options must be justified against free alternatives.",
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "URL or name of data source"},
-                    "action": {"type": "string", "description": "What action to check (scrape, purchase, api_call)"},
-                    "estimated_cost": {"type": "number", "description": "Estimated cost in USD"},
+                    "source": {"type": "string"},
+                    "candidate_source": {"type": "string"},
+                    "action": {"type": "string"},
+                    "estimated_cost": {"type": "number"},
+                    "source_mode": {
+                        "type": "string",
+                        "enum": ["api_code", "web_scraping"],
+                    },
+                    "api_available": {"type": "boolean"},
+                    "requires_account": {"type": "boolean"},
+                    "requires_api_key": {"type": "boolean"},
+                    "requires_paid_plan": {"type": "boolean"},
+                    "estimated_requests": {"type": "number"},
+                    "estimated_subscription_cost": {"type": "number"},
+                    "pricing_source": {"type": "string"},
+                    "free_alternatives_considered": {"type": "array", "items": {"type": "string"}},
+                    "cost_notes": {"type": "string"},
                 },
-                "required": ["source", "action"],
+                "required": ["source", "action", "source_mode"],
             },
         ),
         types.FunctionDeclaration(
             name="call_script_writer",
-            description="Generate a Python scraping/data-collection script",
+            description="Generate or repair a precise financial-data extraction script using a preselected source.",
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "Target URL or API"},
-                    "target_data": {"type": "string", "description": "What data to collect"},
-                    "output_schema": {"type": "object", "description": "Expected output columns/types"},
-                    "params": {"type": "object", "description": "Additional params like ticker, date range"},
+                    "source": {"type": "string"},
+                    "target_data": {"type": "string"},
+                    "source_details": {"type": "object"},
+                    "constraints": {"type": "object"},
+                    "required_columns": {"type": "array", "items": {"type": "string"}},
+                    "row_count_target": {"type": "integer"},
+                    "row_count_range": {"type": "object"},
+                    "time_range": {"type": "string"},
+                    "symbols": {"type": "array", "items": {"type": "string"}},
+                    "auth_requirements": {"type": "object"},
+                    "output_schema": {"type": "object"},
+                    "output_contract": {"type": "object"},
+                    "params": {"type": "object"},
+                    "repair_context": {"type": "object"},
+                    "plan_step_id": {"type": "string"},
                 },
                 "required": ["source", "target_data"],
             },
         ),
         types.FunctionDeclaration(
             name="call_web_crawler",
-            description="Use browser automation to navigate a website and extract data",
+            description="Use browser automation for provider reconnaissance, account setup, API-key retrieval, or browser-based extraction.",
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "Starting URL"},
-                    "task_description": {"type": "string", "description": "What to do on the site"},
-                    "extract_schema": {"type": "object", "description": "What data to extract"},
+                    "url": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["recon", "account_setup", "extract"]},
+                    "provider": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "auth_goal": {"type": "string"},
+                    "task_description": {"type": "string"},
+                    "extract_schema": {"type": "object"},
+                    "required_user_inputs": {"type": "array", "items": {"type": "object"}},
+                    "paid_context": {"type": "object"},
+                    "plan_step_id": {"type": "string"},
                 },
                 "required": ["url", "task_description"],
             },
@@ -129,10 +229,10 @@ def _build_tools() -> list[types.Tool]:
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "schema": {"type": "object", "description": "Column names and types"},
-                    "row_count": {"type": "integer", "description": "Number of rows to generate"},
-                    "domain_context": {"type": "string", "description": "Domain context for realistic data"},
-                    "statistical_properties": {"type": "object", "description": "Distributions, correlations"},
+                    "schema": {"type": "object"},
+                    "row_count": {"type": "integer"},
+                    "domain_context": {"type": "string"},
+                    "statistical_properties": {"type": "object"},
                 },
                 "required": ["schema", "row_count", "domain_context"],
             },
@@ -143,33 +243,56 @@ def _build_tools() -> list[types.Tool]:
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "input_dataset_id": {"type": "string", "description": "ID of dataset to normalize"},
-                    "target_schema": {"type": "object", "description": "Target column names/types"},
-                    "operations": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Operations: rename, cast, dedup, fill_nulls",
-                    },
+                    "input_dataset_id": {"type": "string"},
+                    "target_schema": {"type": "object"},
+                    "operations": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["input_dataset_id", "target_schema"],
             },
         ),
         types.FunctionDeclaration(
             name="call_validator",
-            description="Validate a dataset for quality and completeness",
+            description="Validate a dataset against a strict financial-data contract, including schema and row-count range.",
             parameters_json_schema={
                 "type": "object",
                 "properties": {
-                    "input_dataset_id": {"type": "string", "description": "ID of dataset to validate"},
-                    "checks": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Checks: completeness, schema_match, no_nulls, statistical_sanity, coverage",
-                    },
-                    "expected_row_count": {"type": "integer", "description": "Expected number of rows"},
-                    "use_case": {"type": "string", "description": "What the data will be used for"},
+                    "input_dataset_id": {"type": "string"},
+                    "checks": {"type": "array", "items": {"type": "string"}},
+                    "expected_row_count": {"type": "integer"},
+                    "expected_schema": {"type": "object"},
+                    "required_columns": {"type": "array", "items": {"type": "string"}},
+                    "row_count_target": {"type": "integer"},
+                    "row_count_range": {"type": "object"},
+                    "strict_schema": {"type": "boolean"},
+                    "repair_attempt": {"type": "integer"},
+                    "use_case": {"type": "string"},
+                    "plan_step_id": {"type": "string"},
                 },
                 "required": ["input_dataset_id", "checks"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="request_user_input",
+            description="Pause the run and request structured user input such as API keys, credentials, OTPs, or account information.",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "request": {"type": "object"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["request"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="request_paid_approval",
+            description="Pause the run before a paid-provider step and request explicit user approval with the exact live price and manual checkout requirement.",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "approval": {"type": "object"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["approval"],
             },
         ),
         types.FunctionDeclaration(
@@ -177,9 +300,7 @@ def _build_tools() -> list[types.Tool]:
             description="Present a data collection plan to the user for approval",
             parameters_json_schema={
                 "type": "object",
-                "properties": {
-                    "plan": {"type": "object", "description": "The full plan object"},
-                },
+                "properties": {"plan": {"type": "object"}},
                 "required": ["plan"],
             },
         ),
@@ -188,9 +309,7 @@ def _build_tools() -> list[types.Tool]:
             description="Mark the run as complete. Call this when all plan steps are done.",
             parameters_json_schema={
                 "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "Summary of what was accomplished"},
-                },
+                "properties": {"summary": {"type": "string"}},
                 "required": ["summary"],
             },
         ),
@@ -199,7 +318,6 @@ def _build_tools() -> list[types.Tool]:
 
 
 def _normalize_tool_args(args: Any) -> dict[str, Any]:
-    """Convert SDK function-call args into plain dicts for LangChain state."""
     if args is None:
         return {}
     if isinstance(args, dict):
@@ -213,7 +331,6 @@ def _normalize_tool_args(args: Any) -> dict[str, Any]:
 
 
 def _message_content_to_text(content: Any) -> str:
-    """Flatten LangChain message content into plain text for Gemini."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -224,10 +341,8 @@ def _message_content_to_text(content: Any) -> str:
             if isinstance(item, str):
                 parts.append(item)
                 continue
-            if isinstance(item, dict):
-                text = item.get("text")
-                if text:
-                    parts.append(str(text))
+            if isinstance(item, dict) and item.get("text"):
+                parts.append(str(item["text"]))
                 continue
             text = getattr(item, "text", None)
             if text:
@@ -237,35 +352,71 @@ def _message_content_to_text(content: Any) -> str:
 
 
 def _text_parts(content: Any) -> list[types.Part]:
-    """Build Gemini text parts from a LangChain message content payload."""
     text = _message_content_to_text(content).strip()
-    if not text:
-        return []
-    return [types.Part.from_text(text=text)]
+    return [types.Part.from_text(text=text)] if text else []
+
+
+def _serialize_part(part: Any) -> dict[str, Any]:
+    if hasattr(part, "model_dump"):
+        data = part.model_dump()
+    elif isinstance(part, dict):
+        data = dict(part)
+    else:
+        data = {}
+
+    thought_signature = data.get("thought_signature")
+    if isinstance(thought_signature, (bytes, bytearray)):
+        data["thought_signature"] = base64.b64encode(thought_signature).decode("ascii")
+
+    return data
+
+
+def _deserialize_part(data: dict[str, Any]) -> types.Part:
+    payload = dict(data)
+    thought_signature = payload.get("thought_signature")
+    if isinstance(thought_signature, str):
+        try:
+            payload["thought_signature"] = base64.b64decode(thought_signature)
+        except Exception:
+            payload.pop("thought_signature", None)
+    return types.Part.model_validate(payload)
+
+
+def _build_content_from_raw(raw_content: dict[str, Any] | None) -> types.Content | None:
+    if not raw_content:
+        return None
+
+    role = raw_content.get("role", "model")
+    parts = [_deserialize_part(part) for part in raw_content.get("parts", [])]
+    if not parts:
+        return None
+    return types.Content(role=role, parts=parts)
 
 
 def _message_to_genai_content(message: Any) -> types.Content | None:
-    """Convert LangChain messages stored in state into Google Gen AI contents."""
     if isinstance(message, SystemMessage):
         return None
 
     if isinstance(message, HumanMessage):
         parts = _text_parts(message.content)
-        if not parts:
-            return None
-        return types.Content(role="user", parts=parts)
+        return types.Content(role="user", parts=parts) if parts else None
 
     if not isinstance(message, AIMessage):
         return None
 
+    raw_content = message.additional_kwargs.get("genai_content")
+    preserved = _build_content_from_raw(raw_content)
+    if preserved is not None:
+        return preserved
+
     tool_name = TOOL_RESPONSE_MAP.get(message.name or "")
     if tool_name and not message.tool_calls:
         return types.Content(
-            role="tool",
+            role="user",
             parts=[
                 types.Part.from_function_response(
                     name=tool_name,
-                    response={"content": _message_content_to_text(message.content)},
+                    response={"result": _message_content_to_text(message.content)},
                 )
             ],
         )
@@ -282,38 +433,36 @@ def _message_to_genai_content(message: Any) -> types.Content | None:
             )
         )
 
-    if not parts:
-        return None
-
-    return types.Content(role="model", parts=parts)
-
-
-def _extract_tool_call(response: AIMessage) -> tuple[str | None, dict | None]:
-    """Extract the first tool call from an AI response, if any."""
-    if not response.tool_calls:
-        return None, None
-
-    tool_call = response.tool_calls[0]
-    return tool_call["name"], tool_call["args"]
+    return types.Content(role="model", parts=parts) if parts else None
 
 
 def _response_to_ai_message(response: Any) -> AIMessage:
-    """Convert a Google Gen AI response into the LangChain message shape the graph expects."""
+    candidate_content = None
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        candidate_content = getattr(candidates[0], "content", None)
+
     try:
         content = response.text or ""
     except Exception:
         content = ""
 
+    if not content and candidate_content is not None:
+        text_parts: list[str] = []
+        for part in getattr(candidate_content, "parts", []) or []:
+            text = getattr(part, "text", None)
+            if text:
+                text_parts.append(str(text))
+        content = "\n".join(text_parts)
+
     tool_calls = []
     for function_call in getattr(response, "function_calls", None) or []:
         name = getattr(function_call, "name", None)
         args = getattr(function_call, "args", None)
-
         nested_call = getattr(function_call, "function_call", None)
         if nested_call is not None:
             name = name or getattr(nested_call, "name", None)
             args = args or getattr(nested_call, "args", None)
-
         if name:
             tool_calls.append({
                 "name": name,
@@ -322,136 +471,254 @@ def _response_to_ai_message(response: Any) -> AIMessage:
                 "type": "tool_call",
             })
 
-    return AIMessage(content=content, tool_calls=tool_calls)
+    additional_kwargs: dict[str, Any] = {}
+    if candidate_content is not None:
+        additional_kwargs["genai_content"] = {
+            "role": getattr(candidate_content, "role", "model"),
+            "parts": [_serialize_part(part) for part in getattr(candidate_content, "parts", []) or []],
+        }
+
+    return AIMessage(content=content, tool_calls=tool_calls, additional_kwargs=additional_kwargs)
 
 
-async def orchestrator_node(state: DataCrawlState) -> dict:
-    """The orchestrator LangGraph node."""
+def _extract_tool_call(response: AIMessage) -> tuple[str | None, dict[str, Any] | None]:
+    if not response.tool_calls:
+        return None, None
+    tool_call = response.tool_calls[0]
+    return tool_call["name"], tool_call["args"]
+
+
+async def _invoke_gemini(state: DataCrawlState, contents: list[types.Content], system_instruction: str) -> Any:
+    if not settings.GOOGLE_API_KEY:
+        raise LLMServiceError(
+            provider="gemini",
+            model=ORCHESTRATOR_MODEL,
+            reason="missing_api_key",
+            detail="GOOGLE_API_KEY is not configured.",
+        )
+
+    client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+    try:
+        async with client.aio as aio_client:
+            return await run_cancellable(
+                state["user_id"],
+                state["project_id"],
+                state["run_id"],
+                aio_client.models.generate_content(
+                    model=ORCHESTRATOR_MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.7,
+                        tools=_build_tools(),
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    ),
+                ),
+            )
+    except LLMServiceError:
+        raise
+    except Exception as exc:
+        raise LLMServiceError(
+            provider="gemini",
+            model=ORCHESTRATOR_MODEL,
+            reason="provider_error",
+            detail=str(exc),
+        ) from exc
+
+
+async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
+    plan_json = json.dumps(state.get("plan") or {}, default=str)
+    latest_validation_json = json.dumps(state.get("last_validation_result") or {}, default=str)
+    latest_script_json = json.dumps(state.get("last_script_task") or {}, default=str)
+    retry_json = json.dumps(state.get("retry_counters") or {}, default=str)
+    source_research_json = json.dumps(state.get("source_research") or [], default=str)
     budget_ctx = (
         f"\n\nProject context:\n"
         f"- External-cost budget: ${state.get('budget_total', 0):.2f}\n"
-        f"- External costs spent so far: ${state.get('budget_spent', 0):.2f}"
+        f"- External costs spent so far: ${state.get('budget_spent', 0):.2f}\n"
+        f"- plan_approved: {state.get('plan_approved', False)}\n"
+        f"- current_status: {state.get('status', '')}\n"
+        f"- current_plan: {plan_json}\n"
+        f"- latest_validation_result: {latest_validation_json}\n"
+        f"- latest_script_task: {latest_script_json}\n"
+        f"- retry_counters: {retry_json}\n"
+        f"- source_research: {source_research_json}"
     )
 
-    contents = []
+    contents: list[types.Content] = []
     for message in state.get("messages", []):
         converted = _message_to_genai_content(message)
         if converted is not None:
             contents.append(converted)
 
-    async with genai.Client(api_key=settings.GOOGLE_API_KEY).aio as client:
-        sdk_response = await client.models.generate_content(
-            model=ORCHESTRATOR_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=f"{ORCHESTRATOR_SYSTEM_PROMPT}{budget_ctx}",
-                temperature=0.7,
-                tools=_build_tools(),
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
-                ),
-            ),
+    log_id = start_agent_log(
+        state["user_id"],
+        state["project_id"],
+        state["run_id"],
+        agent_name="orchestrator",
+        action="reason",
+        summary="Reasoning about the next step",
+        current_task=state.get("current_task"),
+    )
+
+    try:
+        sdk_response = await _invoke_gemini(
+            state,
+            contents,
+            f"{ORCHESTRATOR_SYSTEM_PROMPT}{budget_ctx}",
         )
+        response = _response_to_ai_message(sdk_response)
+        tool_name, tool_args = _extract_tool_call(response)
 
-    response = _response_to_ai_message(sdk_response)
-    tool_name, tool_args = _extract_tool_call(response)
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Present plan for approval
-    if tool_name == "present_plan":
-        plan = (tool_args or {}).get("plan", {})
-        if not plan.get("plan_id"):
-            plan["plan_id"] = str(uuid.uuid4())
-
-        user_decision = interrupt({
-            "type": "plan_approval",
-            "plan": plan,
-            "message": "Please review this data collection plan. Reply with 'approve' to proceed or describe changes you'd like.",
-        })
-
-        if isinstance(user_decision, dict) and user_decision.get("approved"):
+        if tool_name == "present_plan":
+            plan = (tool_args or {}).get("plan", {})
+            if not plan.get("plan_id"):
+                plan["plan_id"] = str(uuid.uuid4())
+            finish_agent_log(
+                state["user_id"],
+                state["project_id"],
+                state["run_id"],
+                log_id=log_id,
+                status="completed",
+                summary=f"Prepared plan with {len(plan.get('steps', []))} steps",
+                details=plan,
+                clear_current_task=True,
+            )
+            summary = response.content or "I have a plan ready for approval."
             return {
                 "plan": plan,
-                "plan_approved": True,
-                "status": "running",
-                "messages": [
-                    response,
-                    AIMessage(content="Plan approved! Starting data collection..."),
-                ],
-                "agent_logs": [{
-                    "agent": "orchestrator",
-                    "action": "plan_approved",
-                    "status": "completed",
-                    "summary": f"Plan approved: {plan.get('description', '')}",
-                    "timestamp": now,
-                }],
+                "plan_approved": False,
+                "status": "awaiting_approval",
+                "budget_analysis": plan.get("budget_analysis"),
+                "plan_version": int(state.get("plan_version", 0) or 0) + 1,
+                "messages": [response, AIMessage(content=summary)],
+                "current_agent": "",
+                "current_task": None,
+                "pending_input_request": None,
+                "pending_paid_approval": None,
             }
 
-        feedback = (
-            user_decision.get("feedback", "User requested changes")
-            if isinstance(user_decision, dict)
-            else str(user_decision)
+        if tool_name == "request_user_input":
+            request_payload = dict((tool_args or {}).get("request", {}) or {})
+            if not request_payload.get("request_id"):
+                request_payload["request_id"] = str(uuid.uuid4())
+            request_payload.setdefault("resume_phase", "execution" if state.get("plan_approved") else "planning")
+            summary = (tool_args or {}).get("summary") or response.content or "Additional input is required before continuing."
+            finish_agent_log(
+                state["user_id"],
+                state["project_id"],
+                state["run_id"],
+                log_id=log_id,
+                status="completed",
+                summary="Awaiting structured user input",
+                details=request_payload,
+                clear_current_task=True,
+            )
+            return {
+                "status": "awaiting_user_input",
+                "current_phase": "awaiting_user_input",
+                "pending_input_request": request_payload,
+                "pending_paid_approval": None,
+                "messages": [response, AIMessage(content=summary)],
+                "current_agent": "",
+                "current_task": None,
+            }
+
+        if tool_name == "request_paid_approval":
+            approval_payload = dict((tool_args or {}).get("approval", {}) or {})
+            if not approval_payload.get("request_id"):
+                approval_payload["request_id"] = str(uuid.uuid4())
+            approval_payload.setdefault("resume_phase", "execution")
+            approval_payload.setdefault("requires_manual_checkout", True)
+            summary = (tool_args or {}).get("summary") or response.content or "A paid provider requires your approval before execution can continue."
+            finish_agent_log(
+                state["user_id"],
+                state["project_id"],
+                state["run_id"],
+                log_id=log_id,
+                status="completed",
+                summary="Awaiting paid approval",
+                details=approval_payload,
+                clear_current_task=True,
+            )
+            return {
+                "status": "awaiting_paid_approval",
+                "current_phase": "awaiting_paid_approval",
+                "pending_paid_approval": approval_payload,
+                "pending_input_request": None,
+                "messages": [response, AIMessage(content=summary)],
+                "current_agent": "",
+                "current_task": None,
+            }
+
+        agent_map = {
+            "call_compliance": "compliance",
+            "call_script_writer": "script_writer",
+            "call_web_crawler": "web_crawler",
+            "call_synthetic_generator": "synthetic_generator",
+            "call_normalizer": "normalizer",
+            "call_validator": "validator",
+        }
+
+        if tool_name in agent_map:
+            target_agent = agent_map[tool_name]
+            finish_agent_log(
+                state["user_id"],
+                state["project_id"],
+                state["run_id"],
+                log_id=log_id,
+                status="completed",
+                summary=f"Delegating to {target_agent}",
+                details=tool_args,
+            )
+            return {
+                "current_agent": target_agent,
+                "current_task": tool_args,
+                "messages": [response],
+                "active_plan_step_id": (tool_args or {}).get("plan_step_id"),
+                "last_script_task": tool_args if target_agent == "script_writer" else state.get("last_script_task"),
+            }
+
+        if tool_name == "finish":
+            finish_agent_log(
+                state["user_id"],
+                state["project_id"],
+                state["run_id"],
+                log_id=log_id,
+                status="completed",
+                summary=(tool_args or {}).get("summary", "Run completed"),
+                clear_current_task=True,
+            )
+            return {
+                "status": "completed",
+                "messages": [response],
+                "current_agent": "",
+                "current_task": None,
+            }
+
+        finish_agent_log(
+            state["user_id"],
+            state["project_id"],
+            state["run_id"],
+            log_id=log_id,
+            status="completed",
+            summary=(response.content or "Responded to the user")[:200],
+            clear_current_task=True,
         )
         return {
-            "plan": None,
-            "plan_approved": False,
-            "messages": [response, HumanMessage(content=feedback)],
-            "agent_logs": [{
-                "agent": "orchestrator",
-                "action": "plan_revision_requested",
-                "status": "completed",
-                "summary": f"User requested plan changes: {feedback}",
-                "timestamp": now,
-            }],
-        }
-
-    # Route to sub-agent
-    agent_map = {
-        "call_compliance": "compliance",
-        "call_script_writer": "script_writer",
-        "call_web_crawler": "web_crawler",
-        "call_synthetic_generator": "synthetic_generator",
-        "call_normalizer": "normalizer",
-        "call_validator": "validator",
-    }
-
-    if tool_name in agent_map:
-        target_agent = agent_map[tool_name]
-        return {
-            "current_agent": target_agent,
-            "current_task": tool_args,
             "messages": [response],
-            "agent_logs": [{
-                "agent": "orchestrator",
-                "action": f"delegate_to_{target_agent}",
-                "status": "completed",
-                "summary": f"Routing task to {target_agent}",
-                "timestamp": now,
-            }],
+            "current_agent": "",
+            "current_task": None,
         }
-
-    # Finish
-    if tool_name == "finish":
-        return {
-            "status": "completed",
-            "messages": [response],
-            "agent_logs": [{
-                "agent": "orchestrator",
-                "action": "finish",
-                "status": "completed",
-                "summary": (tool_args or {}).get("summary", "Run completed"),
-                "timestamp": now,
-            }],
-        }
-
-    # Conversational response (no tool call)
-    return {
-        "messages": [response],
-        "agent_logs": [{
-            "agent": "orchestrator",
-            "action": "respond",
-            "status": "completed",
-            "summary": response.content[:200] if response.content else "",
-            "timestamp": now,
-        }],
-    }
+    except Exception as exc:
+        finish_agent_log(
+            state["user_id"],
+            state["project_id"],
+            state["run_id"],
+            log_id=log_id,
+            status="failed",
+            summary=f"Orchestrator failed: {exc}",
+            details={"error": str(exc)},
+            clear_current_task=True,
+        )
+        raise

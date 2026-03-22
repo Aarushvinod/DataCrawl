@@ -2,10 +2,12 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Send } from 'lucide-react';
 import api from '../../services/api';
-import { useFirestoreDoc } from '../../hooks/useFirestoreDoc';
 import ChatMessage from './ChatMessage';
 import PlanApproval from './PlanApproval';
 import AgentActivityLog from './AgentActivityLog';
+import LiveReasoningPanel from './LiveReasoningPanel';
+import RunInputRequest from './RunInputRequest';
+import PaidApprovalRequest from './PaidApprovalRequest';
 
 interface Message {
   id?: string;
@@ -19,9 +21,12 @@ interface AgentStep {
   agent_name: string;
   action: string;
   status: string;
+  summary?: string;
+  started_at?: string;
+  completed_at?: string;
   duration_seconds?: number;
   cost?: number;
-  details?: string;
+  details?: unknown;
 }
 
 interface PlanStep {
@@ -30,17 +35,64 @@ interface PlanStep {
   estimated_cost?: number;
 }
 
+interface StructuredRequest {
+  request_id: string;
+  type?: string;
+  title?: string;
+  instructions?: string;
+  fields?: Array<{
+    id: string;
+    label?: string;
+    input_type?: string;
+    placeholder?: string;
+    required?: boolean;
+    help_text?: string;
+  }>;
+  provider?: string;
+}
+
+interface PaidApprovalRequestPayload {
+  request_id: string;
+  provider?: string;
+  live_price?: {
+    amount?: number;
+    currency?: string;
+    cadence?: string;
+    source?: string;
+  };
+  planned_price?: number | null;
+  reason?: string;
+  payment_unlocks?: string;
+  free_alternatives?: string[];
+  requires_manual_checkout?: boolean;
+  manual_checkout_instructions?: string;
+  checkout_url?: string;
+}
+
 interface RunDoc {
   id: string;
   status: string;
   messages: Message[];
-  steps: AgentStep[];
+  agent_logs: AgentStep[];
   budget_spent: number;
   budget_total: number;
+  current_phase: string;
+  current_agent: string;
+  current_task?: Record<string, unknown> | null;
+  pending_input_request?: StructuredRequest | null;
+  pending_paid_approval?: PaidApprovalRequestPayload | null;
+  budget_analysis?: Record<string, unknown> | null;
+  plan_version?: number;
+  active_plan_step_id?: string | null;
+  retry_counters?: Record<string, number>;
+  progress_percent: number;
+  total_steps: number;
+  completed_steps: number;
+  error?: string | null;
   plan?: {
-    summary: string;
+    description?: string;
     steps: PlanStep[];
-    estimated_total_cost?: number;
+    estimated_cost?: number;
   };
 }
 
@@ -49,30 +101,35 @@ export default function AgentChat() {
   const navigate = useNavigate();
   const [inputValue, setInputValue] = useState('');
   const [sending, setSending] = useState(false);
+  const [run, setRun] = useState<RunDoc | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Real-time Firestore subscription
-  const firestorePath = projectId && runId ? `runs/${runId}` : null;
-  const { data: runDoc } = useFirestoreDoc<RunDoc>(firestorePath);
-
-  // Fallback: fetch from API if Firestore not available
-  const [fallbackData, setFallbackData] = useState<RunDoc | null>(null);
-
   const fetchFallback = useCallback(async () => {
-    if (runDoc || !projectId || !runId) return;
+    if (!projectId || !runId) return;
     try {
       const data = await api.get<RunDoc>(`/api/projects/${projectId}/runs/${runId}`);
-      setFallbackData(data);
+      setRun(data);
     } catch {
       // Failed to fetch
     }
-  }, [projectId, runId, runDoc]);
+  }, [projectId, runId]);
 
   useEffect(() => {
     fetchFallback();
   }, [fetchFallback]);
 
-  const run = runDoc || fallbackData;
+  useEffect(() => {
+    if (!run || !projectId || !runId) return;
+    if (!['planning', 'awaiting_approval', 'approved', 'running', 'awaiting_user_input', 'awaiting_paid_approval'].includes(run.status)) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void fetchFallback();
+    }, 500);
+
+    return () => window.clearInterval(intervalId);
+  }, [fetchFallback, projectId, run, runId]);
 
   // Scroll to bottom on new messages
   useEffect(() => {
@@ -90,10 +147,7 @@ export default function AgentChat() {
       await api.post(`/api/projects/${projectId}/runs/${runId}/message`, {
         message,
       });
-      // If no Firestore, refetch
-      if (!runDoc) {
-        await fetchFallback();
-      }
+      await fetchFallback();
     } catch {
       // Send failed
     } finally {
@@ -109,18 +163,19 @@ export default function AgentChat() {
   }
 
   function handleApproved() {
-    if (!runDoc) {
-      fetchFallback();
-    }
+    void fetchFallback();
   }
 
   const messages = run?.messages || [];
-  const steps = run?.steps || [];
+  const steps = run?.agent_logs || [];
   const isAwaitingApproval = run?.status === 'awaiting_approval';
+  const isAwaitingStructuredInput = run?.status === 'awaiting_user_input' && Boolean(run?.pending_input_request);
+  const isAwaitingPaidApproval = run?.status === 'awaiting_paid_approval' && Boolean(run?.pending_paid_approval);
   const isActive =
     run?.status === 'planning' ||
     run?.status === 'running' ||
-    run?.status === 'awaiting_approval';
+    run?.status === 'awaiting_approval' ||
+    run?.status === 'approved';
   const inputPlaceholder = messages.length === 0
     ? 'Describe what data you want to collect...'
     : isActive
@@ -158,15 +213,60 @@ export default function AgentChat() {
           <div>
             <div style={{ fontWeight: 600, fontSize: 15 }}>Run {runId?.slice(0, 8)}</div>
             {run && (
-              <span
-                className={`badge badge--${run.status === 'running' ? 'running' : run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'awaiting_approval' ? 'awaiting' : 'pending'}`}
-                style={{ fontSize: 11 }}
-              >
-                {run.status.replace('_', ' ')}
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 4 }}>
+                <span
+                  className={`badge badge--${run.status === 'running' ? 'running' : run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'awaiting_approval' ? 'awaiting' : 'pending'}`}
+                  style={{ fontSize: 11 }}
+                >
+                  {run.status.replace('_', ' ')}
+                </span>
+                <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  {run.current_agent ? `Current agent: ${run.current_agent}` : run.current_phase}
+                </span>
+              </div>
             )}
           </div>
         </div>
+
+        {run && (
+          <div
+            style={{
+              padding: '10px 20px 0',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+                marginBottom: 6,
+              }}
+            >
+              <span>{run.current_phase || 'idle'}</span>
+              <span>{run.progress_percent}%</span>
+            </div>
+            <div className="budget-meter">
+              <div
+                className="budget-meter__fill"
+                style={{
+                  width: `${run.progress_percent}%`,
+                  backgroundColor: 'var(--accent-blue)',
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {run && (
+          <LiveReasoningPanel
+            runStatus={run.status}
+            currentAgent={run.current_agent}
+            currentPhase={run.current_phase}
+            currentTask={run.current_task}
+            steps={steps}
+          />
+        )}
 
         {/* Messages */}
         <div
@@ -207,6 +307,33 @@ export default function AgentChat() {
             />
           )}
 
+          {isAwaitingStructuredInput && projectId && runId && run?.pending_input_request && (
+            <RunInputRequest
+              projectId={projectId}
+              runId={runId}
+              request={run.pending_input_request}
+              onResolved={handleApproved}
+            />
+          )}
+
+          {isAwaitingPaidApproval && projectId && runId && run?.pending_paid_approval && (
+            <PaidApprovalRequest
+              projectId={projectId}
+              runId={runId}
+              request={run.pending_paid_approval}
+              onResolved={handleApproved}
+            />
+          )}
+
+          {run?.error && run.status === 'failed' && (
+            <div
+              className="card"
+              style={{ marginTop: 12, borderColor: 'var(--color-error)', color: 'var(--color-error)' }}
+            >
+              {run.error}
+            </div>
+          )}
+
           <div ref={messagesEndRef} />
         </div>
 
@@ -229,7 +356,7 @@ export default function AgentChat() {
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={inputPlaceholder}
-              disabled={!isActive && messages.length > 0}
+              disabled={(!isActive && messages.length > 0) || isAwaitingStructuredInput || isAwaitingPaidApproval}
               rows={1}
               style={{
                 flex: 1,
@@ -242,7 +369,7 @@ export default function AgentChat() {
             <button
               className="btn btn--primary"
               onClick={handleSend}
-              disabled={!inputValue.trim() || sending}
+              disabled={!inputValue.trim() || sending || !isActive || isAwaitingStructuredInput || isAwaitingPaidApproval}
               style={{ height: 40, width: 40, padding: 0 }}
             >
               <Send size={16} />
@@ -260,6 +387,11 @@ export default function AgentChat() {
           budgetSpent={run?.budget_spent || 0}
           budgetTotal={run?.budget_total || 0}
           runStatus={run?.status || 'pending'}
+          progressPercent={run?.progress_percent || 0}
+          currentAgent={run?.current_agent || ''}
+          currentPhase={run?.current_phase || 'idle'}
+          completedSteps={run?.completed_steps || 0}
+          totalSteps={run?.total_steps || 0}
           onKilled={handleApproved}
         />
       </div>

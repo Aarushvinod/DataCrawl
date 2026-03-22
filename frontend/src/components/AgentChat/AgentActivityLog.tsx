@@ -17,9 +17,12 @@ interface AgentStep {
   agent_name: string;
   action: string;
   status: string;
+  summary?: string;
+  started_at?: string;
+  completed_at?: string;
   duration_seconds?: number;
   cost?: number;
-  details?: string;
+  details?: unknown;
 }
 
 interface AgentActivityLogProps {
@@ -29,6 +32,11 @@ interface AgentActivityLogProps {
   budgetSpent: number;
   budgetTotal: number;
   runStatus: string;
+  progressPercent: number;
+  currentAgent: string;
+  currentPhase: string;
+  completedSteps: number;
+  totalSteps: number;
   onKilled: () => void;
 }
 
@@ -53,6 +61,16 @@ function formatDuration(seconds?: number): string {
   return `${mins}m ${secs}s`;
 }
 
+function sanitizeDetails(details: unknown): unknown {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) {
+    return details;
+  }
+
+  const nextDetails = { ...(details as Record<string, unknown>) };
+  delete nextDetails.thinking;
+  return Object.keys(nextDetails).length > 0 ? nextDetails : null;
+}
+
 export default function AgentActivityLog({
   projectId,
   runId,
@@ -60,6 +78,11 @@ export default function AgentActivityLog({
   budgetSpent,
   budgetTotal,
   runStatus,
+  progressPercent,
+  currentAgent,
+  currentPhase,
+  completedSteps,
+  totalSteps,
   onKilled,
 }: AgentActivityLogProps) {
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set());
@@ -101,7 +124,7 @@ export default function AgentActivityLog({
         ? 'var(--color-warning)'
         : 'var(--accent-blue)';
 
-  const isRunning = runStatus === 'running' || runStatus === 'awaiting_approval';
+  const isRunning = ['planning', 'awaiting_approval', 'approved', 'running'].includes(runStatus);
 
   return (
     <div
@@ -171,6 +194,32 @@ export default function AgentActivityLog({
             />
           </div>
         </div>
+
+        <div style={{ marginTop: 12 }}>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              fontSize: 12,
+              color: 'var(--text-secondary)',
+              marginBottom: 4,
+            }}
+          >
+            <span>{currentAgent ? `${currentPhase}: ${currentAgent}` : currentPhase}</span>
+            <span className="mono">
+              {totalSteps > 0 ? `${completedSteps}/${totalSteps}` : `${progressPercent}%`}
+            </span>
+          </div>
+          <div className="budget-meter">
+            <div
+              className="budget-meter__fill"
+              style={{
+                width: `${progressPercent}%`,
+                backgroundColor: 'var(--accent-blue)',
+              }}
+            />
+          </div>
+        </div>
       </div>
 
       {/* Steps */}
@@ -190,6 +239,7 @@ export default function AgentActivityLog({
         )}
         {steps.map((step) => {
           const isExpanded = expandedSteps.has(step.id);
+          const visibleDetails = sanitizeDetails(step.details);
           return (
             <div
               key={step.id}
@@ -256,7 +306,7 @@ export default function AgentActivityLog({
                   <div style={{ marginBottom: 4 }}>
                     <strong>Action:</strong> {step.action}
                   </div>
-                  {step.details && (
+                  {Boolean(visibleDetails) && (
                     <pre
                       style={{
                         fontFamily: 'var(--font-mono)',
@@ -269,8 +319,15 @@ export default function AgentActivityLog({
                         marginTop: 6,
                       }}
                     >
-                      {step.details}
+                      {typeof visibleDetails === 'string'
+                        ? visibleDetails
+                        : JSON.stringify(visibleDetails, null, 2)}
                     </pre>
+                  )}
+                  {step.summary && (
+                    <div style={{ marginTop: 6 }}>
+                      <strong>Summary:</strong> {step.summary}
+                    </div>
                   )}
                 </div>
               )}
