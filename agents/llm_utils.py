@@ -38,8 +38,15 @@ class TogetherResponse:
     response_metadata: dict[str, Any]
 
 
+def describe_exception(exc: Exception) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return detail
+    return f"{exc.__class__.__name__}: {repr(exc)}"
+
+
 def _classify_error(provider: str, model: str, exc: Exception) -> LLMServiceError:
-    detail = str(exc)
+    detail = describe_exception(exc)
     lowered = detail.lower()
 
     if "401" in lowered or "unauthorized" in lowered or "api key" in lowered:
@@ -130,7 +137,7 @@ async def invoke_together(
                             "model": model,
                             "streaming": True,
                         },
-                        summary="Model is thinking..." if reasoning_parts and not content_parts else None,
+                        summary="Working on the next step..." if reasoning_parts and not content_parts else None,
                     )
 
             return TogetherResponse(

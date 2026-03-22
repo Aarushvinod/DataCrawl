@@ -1,16 +1,20 @@
 import { useState } from 'react';
 import {
   Bot,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
-  CheckCircle2,
-  Loader2,
-  XCircle,
-  OctagonX,
-  DollarSign,
   Clock,
+  DollarSign,
+  Loader2,
+  OctagonX,
+  XCircle,
 } from 'lucide-react';
 import api from '../../services/api';
+import { formatActionLabel, formatAgentLabel, formatPhaseLabel } from './uiLabels';
+import ActionSpiderAccent from '../Workspace/ActionSpiderAccent';
+import ConsoleAmbientDigits from '../Workspace/ConsoleAmbientDigits';
+import SignalStrip from '../Workspace/SignalStrip';
 
 interface AgentStep {
   id: string;
@@ -37,15 +41,18 @@ interface AgentActivityLogProps {
   currentPhase: string;
   completedSteps: number;
   totalSteps: number;
+  generationMode: string;
   onKilled: () => void;
 }
 
 function StepStatusIcon({ status }: { status: string }) {
   switch (status) {
     case 'running':
-      return <Loader2 size={14} color="var(--accent-blue)" style={{ animation: 'spin 1s linear infinite' }} />;
+      return <Loader2 size={14} color="var(--accent-primary)" style={{ animation: 'spin 1s linear infinite' }} />;
     case 'completed':
       return <CheckCircle2 size={14} color="var(--color-success)" />;
+    case 'killed':
+      return <OctagonX size={14} color="var(--color-warning)" />;
     case 'failed':
       return <XCircle size={14} color="var(--color-error)" />;
     default:
@@ -53,22 +60,27 @@ function StepStatusIcon({ status }: { status: string }) {
   }
 }
 
-function formatDuration(seconds?: number): string {
+function formatDuration(seconds?: number) {
   if (!seconds) return '--';
   if (seconds < 60) return `${seconds}s`;
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins}m ${secs}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}m ${remainder}s`;
 }
 
-function sanitizeDetails(details: unknown): unknown {
+function sanitizeDetails(details: unknown) {
   if (!details || typeof details !== 'object' || Array.isArray(details)) {
     return details;
   }
 
-  const nextDetails = { ...(details as Record<string, unknown>) };
-  delete nextDetails.thinking;
-  return Object.keys(nextDetails).length > 0 ? nextDetails : null;
+  const visibleDetails = { ...(details as Record<string, unknown>) };
+  delete visibleDetails.thinking;
+  delete visibleDetails.model;
+  delete visibleDetails.model_used;
+  delete visibleDetails.content_preview;
+  delete visibleDetails.streaming;
+  delete visibleDetails.script_preview;
+  return Object.keys(visibleDetails).length > 0 ? visibleDetails : null;
 }
 
 export default function AgentActivityLog({
@@ -83,251 +95,167 @@ export default function AgentActivityLog({
   currentPhase,
   completedSteps,
   totalSteps,
+  generationMode,
   onKilled,
 }: AgentActivityLogProps) {
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set());
-  const [killing, setKilling] = useState(false);
-
-  function toggleStep(stepId: string) {
-    setExpandedSteps((prev) => {
-      const next = new Set(prev);
-      if (next.has(stepId)) {
-        next.delete(stepId);
-      } else {
-        next.add(stepId);
-      }
-      return next;
-    });
-  }
-
-  async function handleKillRun() {
-    if (!confirm('Are you sure you want to kill this run?')) return;
-    setKilling(true);
-    try {
-      await api.post(`/api/projects/${projectId}/runs/${runId}/kill`);
-      onKilled();
-    } catch {
-      // Kill failed
-    } finally {
-      setKilling(false);
-    }
-  }
-
-  const budgetPct = budgetTotal > 0
-    ? Math.min((budgetSpent / budgetTotal) * 100, 100)
-    : 0;
-
+  const [stopping, setStopping] = useState(false);
+  const budgetPct = budgetTotal > 0 ? Math.min((budgetSpent / budgetTotal) * 100, 100) : 0;
   const budgetColor =
     budgetPct > 90
       ? 'var(--color-error)'
       : budgetPct > 70
         ? 'var(--color-warning)'
-        : 'var(--accent-blue)';
-
+        : 'var(--accent-primary)';
   const isRunning = ['planning', 'awaiting_approval', 'approved', 'running'].includes(runStatus);
+  const railSignals = [
+    {
+      label: 'Budget',
+      value: `$${budgetSpent.toFixed(2)}`,
+      note: `of $${budgetTotal.toFixed(2)}`,
+      icon: <DollarSign size={12} />,
+      tone: budgetPct > 70 ? 'warning' as const : 'secondary' as const,
+    },
+    {
+      label: 'Current route',
+      value: currentAgent ? formatAgentLabel(currentAgent) : formatPhaseLabel(currentPhase),
+      note: formatPhaseLabel(currentPhase),
+      icon: <Bot size={12} />,
+      tone: 'primary' as const,
+    },
+    {
+      label: 'Path progress',
+      value: totalSteps > 0 ? `${completedSteps}/${totalSteps}` : `${progressPercent}%`,
+      note: totalSteps > 0 ? 'steps completed' : 'route complete',
+      icon: <Clock size={12} />,
+      tone: 'success' as const,
+    },
+  ];
+
+  async function handleKillRun() {
+    if (!confirm('Stop this run?')) {
+      return;
+    }
+
+    setStopping(true);
+    try {
+      await api.post(`/api/projects/${projectId}/runs/${runId}/kill`);
+      onKilled();
+    } finally {
+      setStopping(false);
+    }
+  }
 
   return (
-    <div
-      style={{
-        height: '100%',
-        display: 'flex',
-        flexDirection: 'column',
-        borderLeft: '1px solid var(--border-color)',
-        backgroundColor: 'var(--bg-surface)',
-      }}
-    >
-      {/* Header */}
-      <div
-        style={{
-          padding: '16px',
-          borderBottom: '1px solid var(--border-color)',
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            marginBottom: 12,
-          }}
-        >
-          <span style={{ fontWeight: 600, fontSize: 14 }}>Agent Activity</span>
+    <div className="dc-activity">
+      <div className="dc-activity__header">
+        <ConsoleAmbientDigits variant="card" tone="mixed" className="dc-activity__ambient" />
+        {isRunning && generationMode !== 'synthetic' && (
+          <ActionSpiderAccent variant="watch" className="dc-activity__spider" />
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', marginBottom: 16 }}>
+          <div>
+            <p className="dc-section__eyebrow" style={{ marginBottom: 8 }}>Run activity</p>
+            <h2 style={{ margin: 0, fontSize: '1.3rem' }}>Search rail</h2>
+          </div>
           {isRunning && (
-            <button
-              className="btn btn--danger"
-              onClick={handleKillRun}
-              disabled={killing}
-              style={{ padding: '4px 12px', fontSize: 12 }}
-            >
+            <button className="btn btn--danger" onClick={() => void handleKillRun()} disabled={stopping}>
               <OctagonX size={14} />
-              {killing ? 'Killing...' : 'Kill Run'}
+              {stopping ? 'Stopping...' : 'Stop run'}
             </button>
           )}
         </div>
 
-        {/* Budget meter */}
-        <div style={{ marginBottom: 4 }}>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              fontSize: 12,
-              color: 'var(--text-secondary)',
-              marginBottom: 4,
-            }}
-          >
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <DollarSign size={12} />
-              Budget
-            </span>
-            <span className="mono">
-              ${budgetSpent.toFixed(2)} / ${budgetTotal.toFixed(2)}
-            </span>
-          </div>
-          <div className="budget-meter">
-            <div
-              className="budget-meter__fill"
-              style={{
-                width: `${budgetPct}%`,
-                backgroundColor: budgetColor,
-              }}
-            />
-          </div>
-        </div>
+        <div style={{ display: 'grid', gap: 14 }}>
+          <SignalStrip items={railSignals} compact />
 
-        <div style={{ marginTop: 12 }}>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              fontSize: 12,
-              color: 'var(--text-secondary)',
-              marginBottom: 4,
-            }}
-          >
-            <span>{currentAgent ? `${currentPhase}: ${currentAgent}` : currentPhase}</span>
-            <span className="mono">
-              {totalSteps > 0 ? `${completedSteps}/${totalSteps}` : `${progressPercent}%`}
-            </span>
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><DollarSign size={12} /> Budget</span>
+              <span className="mono">{`$${budgetSpent.toFixed(2)} / $${budgetTotal.toFixed(2)}`}</span>
+            </div>
+            <div className="budget-meter"><div className="budget-meter__fill" style={{ width: `${budgetPct}%`, backgroundColor: budgetColor }} /></div>
           </div>
-          <div className="budget-meter">
-            <div
-              className="budget-meter__fill"
-              style={{
-                width: `${progressPercent}%`,
-                backgroundColor: 'var(--accent-blue)',
-              }}
-            />
+
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
+              <span>{currentAgent ? `${formatPhaseLabel(currentPhase)} - ${formatAgentLabel(currentAgent)}` : formatPhaseLabel(currentPhase)}</span>
+              <span className="mono">{totalSteps > 0 ? `${completedSteps}/${totalSteps}` : `${progressPercent}%`}</span>
+            </div>
+            <div className="budget-meter"><div className="budget-meter__fill" style={{ width: `${progressPercent}%`, backgroundColor: 'var(--accent-secondary)' }} /></div>
           </div>
         </div>
       </div>
 
-      {/* Steps */}
-      <div style={{ flex: 1, overflow: 'auto', padding: '8px 16px' }}>
-        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
-        {steps.length === 0 && (
-          <div
-            style={{
-              textAlign: 'center',
-              color: 'var(--text-secondary)',
-              padding: '24px 0',
-              fontSize: 13,
-            }}
-          >
-            No agent steps yet.
-          </div>
-        )}
+      <div className="dc-activity__stream">
+        {steps.length === 0 && <div className="dc-empty-state" style={{ minHeight: 220 }}><div>No updates yet.</div></div>}
+
         {steps.map((step) => {
           const isExpanded = expandedSteps.has(step.id);
           const visibleDetails = sanitizeDetails(step.details);
           return (
-            <div
-              key={step.id}
-              style={{
-                marginBottom: 6,
-                borderRadius: 'var(--radius-md)',
-                border: '1px solid var(--border-color)',
-                backgroundColor: 'var(--bg-primary)',
-              }}
-            >
+            <div key={step.id} className="dc-activity-step">
               <div
-                onClick={() => toggleStep(step.id)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: '10px 12px',
-                  cursor: 'pointer',
-                  fontSize: 13,
+                className="dc-activity-step__summary"
+                onClick={() => {
+                  setExpandedSteps((current) => {
+                    const next = new Set(current);
+                    if (next.has(step.id)) {
+                      next.delete(step.id);
+                    } else {
+                      next.add(step.id);
+                    }
+                    return next;
+                  });
+                }}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    setExpandedSteps((current) => {
+                      const next = new Set(current);
+                      if (next.has(step.id)) {
+                        next.delete(step.id);
+                      } else {
+                        next.add(step.id);
+                      }
+                      return next;
+                    });
+                  }
                 }}
               >
-                {isExpanded ? (
-                  <ChevronDown size={14} color="var(--text-secondary)" />
-                ) : (
-                  <ChevronRight size={14} color="var(--text-secondary)" />
-                )}
-                <Bot size={14} color="var(--accent-blue)" />
-                <span
-                  style={{
-                    flex: 1,
-                    fontWeight: 500,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  {step.agent_name}
-                </span>
+                {isExpanded ? <ChevronDown size={14} color="var(--text-secondary)" /> : <ChevronRight size={14} color="var(--text-secondary)" />}
+                <Bot size={14} color="var(--accent-primary)" />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 600 }}>{formatAgentLabel(step.agent_name)}</div>
+                  <div style={{ color: 'var(--text-secondary)', fontSize: 12 }}>{formatActionLabel(step.action)}</div>
+                </div>
                 <StepStatusIcon status={step.status} />
-                <span
-                  className="mono"
-                  style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 40, textAlign: 'right' }}
-                >
-                  {formatDuration(step.duration_seconds)}
-                </span>
-                {step.cost !== undefined && (
-                  <span
-                    className="mono"
-                    style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 45, textAlign: 'right' }}
-                  >
-                    ${step.cost.toFixed(3)}
-                  </span>
-                )}
+                <span className="mono" style={{ color: 'var(--text-muted)', fontSize: 11 }}>{formatDuration(step.duration_seconds)}</span>
+                {step.cost !== undefined && <span className="mono" style={{ color: 'var(--text-muted)', fontSize: 11 }}>{`$${step.cost.toFixed(3)}`}</span>}
               </div>
 
               {isExpanded && (
-                <div
-                  style={{
-                    padding: '0 12px 10px 38px',
-                    fontSize: 13,
-                    color: 'var(--text-secondary)',
-                  }}
-                >
-                  <div style={{ marginBottom: 4 }}>
-                    <strong>Action:</strong> {step.action}
-                  </div>
-                  {Boolean(visibleDetails) && (
+                <div className="dc-activity-step__details">
+                  {step.summary && <div style={{ marginBottom: 8 }}><strong>Summary:</strong> {step.summary}</div>}
+                  {visibleDetails !== null && visibleDetails !== undefined && (
                     <pre
                       style={{
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: 12,
-                        backgroundColor: 'var(--bg-surface)',
-                        padding: 8,
-                        borderRadius: 'var(--radius-sm)',
+                        margin: 0,
+                        padding: 12,
+                        borderRadius: 14,
+                        background: 'rgba(4, 8, 7, 0.92)',
+                        border: '1px solid rgba(127, 255, 178, 0.12)',
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-word',
-                        marginTop: 6,
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 12,
                       }}
                     >
-                      {typeof visibleDetails === 'string'
-                        ? visibleDetails
-                        : JSON.stringify(visibleDetails, null, 2)}
+                      {typeof visibleDetails === 'string' ? visibleDetails : JSON.stringify(visibleDetails, null, 2)}
                     </pre>
-                  )}
-                  {step.summary && (
-                    <div style={{ marginTop: 6 }}>
-                      <strong>Summary:</strong> {step.summary}
-                    </div>
                   )}
                 </div>
               )}

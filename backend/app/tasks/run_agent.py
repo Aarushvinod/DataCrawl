@@ -5,6 +5,7 @@ State is persisted to Firestore; the frontend sees updates via onSnapshot.
 """
 
 import asyncio
+import hashlib
 import uuid
 import traceback
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ from app.services.firebase import get_firestore_client, get_storage_bucket
 from app.services.run_control import (
     RunCancelledError,
     append_message,
+    build_terminal_run_updates,
     clear_run_control,
     ensure_cancel_event,
     ensure_not_cancelled,
@@ -54,6 +56,8 @@ async def run_planning_phase(
     try:
         db = get_firestore_client()
         run_ref = get_run_ref(user_id, project_id, run_id)
+        run_doc = get_run_doc(user_id, project_id, run_id)
+        generation_mode = run_doc.get("generation_mode", "real")
         ensure_cancel_event(run_id)
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -76,6 +80,7 @@ async def run_planning_phase(
             # New run — start fresh
             initial_state = {
                 "run_id": run_id,
+                "generation_mode": generation_mode,
                 "messages": [HumanMessage(content=initial_message)],
                 "plan": None,
                 "plan_approved": False,
@@ -152,19 +157,33 @@ async def run_planning_phase(
             update_run(user_id, project_id, run_id, updates)
 
     except RunCancelledError:
-        update_run(user_id, project_id, run_id, {
-            "status": "killed",
-            "current_phase": "killed",
-            "error": "Run cancelled by user",
-        })
-        append_message(user_id, project_id, run_id, "assistant", "Run cancelled.")
+        current_doc = get_run_doc(user_id, project_id, run_id)
+        if current_doc.get("status") == "killed":
+            update_run(
+                user_id,
+                project_id,
+                run_id,
+                build_terminal_run_updates(
+                    current_doc,
+                    status="killed",
+                    current_phase="killed",
+                    error="Run cancelled by user",
+                ),
+            )
+            append_message(user_id, project_id, run_id, "assistant", "Run cancelled.")
     except Exception as e:
         traceback.print_exc()
-        update_run(user_id, project_id, run_id, {
-            "status": "failed",
-            "current_phase": "failed",
-            "error": str(e),
-        })
+        update_run(
+            user_id,
+            project_id,
+            run_id,
+            build_terminal_run_updates(
+                get_run_doc(user_id, project_id, run_id),
+                status="failed",
+                current_phase="failed",
+                error=str(e),
+            ),
+        )
         append_message(user_id, project_id, run_id, "assistant", f"An error occurred during planning: {str(e)}")
     finally:
         current_task = asyncio.current_task()
@@ -190,6 +209,7 @@ async def run_execution_phase(
 
     try:
         db = get_firestore_client()
+        run_doc = get_run_doc(user_id, project_id, run_id)
         ensure_cancel_event(run_id)
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -209,6 +229,7 @@ async def run_execution_phase(
         result = await graph.ainvoke(
             {
                 "run_id": run_id,
+                "generation_mode": run_doc.get("generation_mode", "real"),
                 "messages": [HumanMessage(content=resume_message or "Plan approved. Execute all steps.")],
                 "plan_approved": True,
                 "status": "running",
@@ -248,12 +269,39 @@ async def run_execution_phase(
         datasets = result.get("datasets", [])
         bucket = get_storage_bucket()
         saved_datasets = []
+        saved_dataset_versions = dict(get_run_doc(user_id, project_id, run_id).get("saved_dataset_versions", {}) or {})
+        datasets_col = (
+            db.collection("users").document(user_id)
+            .collection("projects").document(project_id)
+            .collection("datasets")
+        )
+
+        skipped_unvalidated = 0
 
         for ds in datasets:
+            if not ds.get("validation_passed", False):
+                if ds.get("data_csv") or ds.get("data"):
+                    skipped_unvalidated += 1
+                continue
+
             if ds.get("data_csv") or ds.get("data"):
-                dataset_id = ds.get("id", str(uuid.uuid4()))
                 data_content = ds.get("data_csv") or str(ds.get("data", ""))
+                content_hash = hashlib.sha256(data_content.encode("utf-8")).hexdigest()
+                source_dataset_id = str(ds.get("id") or "")
+                source_dataset_exists = bool(source_dataset_id and datasets_col.document(source_dataset_id).get().exists)
+                previous_hash = saved_dataset_versions.get(source_dataset_id) if source_dataset_id else None
+                if previous_hash and previous_hash == content_hash:
+                    continue
+
+                dataset_id = (
+                    source_dataset_id
+                    if source_dataset_id and source_dataset_id not in saved_dataset_versions and not source_dataset_exists
+                    else str(uuid.uuid4())
+                )
                 file_format = "csv" if ds.get("data_csv") else "json"
+                lineage = dict(ds.get("lineage") or {"source_type": ds.get("type", "unknown")})
+                if source_dataset_id and dataset_id != source_dataset_id:
+                    lineage.setdefault("derived_from_dataset_id", source_dataset_id)
 
                 # Upload to Storage
                 storage_path = f"datasets/{user_id}/{project_id}/{dataset_id}/data.{file_format}"
@@ -268,19 +316,16 @@ async def run_execution_phase(
                     "size_bytes": len(data_content.encode("utf-8")),
                     "row_count": ds.get("row_count", data_content.count("\n")),
                     "columns": ds.get("columns", []),
-                    "lineage": ds.get("lineage", {"source_type": ds.get("type", "unknown")}),
+                    "lineage": lineage,
                     "source_type": ds.get("type", "unknown"),
                     "version": 1,
+                    "content_hash": content_hash,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
 
-                datasets_col = (
-                    db.collection("users").document(user_id)
-                    .collection("projects").document(project_id)
-                    .collection("datasets")
-                )
                 datasets_col.document(dataset_id).set(dataset_doc)
                 saved_datasets.append(dataset_id)
+                saved_dataset_versions[dataset_id] = content_hash
 
         update_run(user_id, project_id, run_id, {
             "status": "completed",
@@ -289,23 +334,56 @@ async def run_execution_phase(
             "current_agent": "",
             "current_task": None,
             "progress_percent": 100,
+            "saved_dataset_versions": saved_dataset_versions,
         })
-        append_message(user_id, project_id, run_id, "assistant", f"Execution complete. {len(saved_datasets)} dataset(s) saved.")
+        if skipped_unvalidated:
+            append_message(
+                user_id,
+                project_id,
+                run_id,
+                "assistant",
+                (
+                    f"Execution complete. {len(saved_datasets)} validated dataset(s) saved. "
+                    f"{skipped_unvalidated} rejected dataset candidate(s) were not saved."
+                ),
+            )
+        else:
+            append_message(
+                user_id,
+                project_id,
+                run_id,
+                "assistant",
+                f"Execution complete. {len(saved_datasets)} validated dataset(s) saved.",
+            )
 
     except RunCancelledError:
-        update_run(user_id, project_id, run_id, {
-            "status": "killed",
-            "current_phase": "killed",
-            "error": "Run cancelled by user",
-        })
-        append_message(user_id, project_id, run_id, "assistant", "Run cancelled.")
+        current_doc = get_run_doc(user_id, project_id, run_id)
+        if current_doc.get("status") == "killed":
+            update_run(
+                user_id,
+                project_id,
+                run_id,
+                build_terminal_run_updates(
+                    current_doc,
+                    status="killed",
+                    current_phase="killed",
+                    error="Run cancelled by user",
+                ),
+            )
+            append_message(user_id, project_id, run_id, "assistant", "Run cancelled.")
     except Exception as e:
         traceback.print_exc()
-        update_run(user_id, project_id, run_id, {
-            "status": "failed",
-            "current_phase": "failed",
-            "error": str(e),
-        })
+        update_run(
+            user_id,
+            project_id,
+            run_id,
+            build_terminal_run_updates(
+                get_run_doc(user_id, project_id, run_id),
+                status="failed",
+                current_phase="failed",
+                error=str(e),
+            ),
+        )
         append_message(user_id, project_id, run_id, "assistant", f"Execution failed: {str(e)}")
     finally:
         current_task = asyncio.current_task()

@@ -5,7 +5,7 @@ import json
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.services.run_control import finish_agent_log, start_agent_log
-from agents.llm_utils import TOGETHER_MODELS, invoke_together
+from agents.llm_utils import TOGETHER_MODELS, describe_exception, invoke_together
 from agents.state import DataCrawlState
 
 NORMALIZER_SYSTEM_PROMPT = """You are the DataCrawl Data Normalizer.
@@ -101,14 +101,15 @@ async def normalizer_node(state: DataCrawlState) -> dict:
             "datasets": [input_data] if input_data else [],
         }
     except Exception as exc:
+        error_detail = describe_exception(exc)
         finish_agent_log(
             state["user_id"],
             state["project_id"],
             state["run_id"],
             log_id=log_id,
             status="failed",
-            summary=f"Normalization failed: {exc}",
-            details={"error": str(exc)},
+            summary=f"Data cleanup failed: {error_detail}",
+            details={"error": error_detail, "error_type": type(exc).__name__},
             clear_current_task=True,
         )
         raise

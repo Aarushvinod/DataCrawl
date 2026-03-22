@@ -6,7 +6,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.services.run_control import finish_agent_log, start_agent_log
-from agents.llm_utils import TOGETHER_MODELS, invoke_together
+from agents.llm_utils import TOGETHER_MODELS, describe_exception, invoke_together
 from agents.state import DataCrawlState
 
 COMPLIANCE_SYSTEM_PROMPT = """You are the DataCrawl Compliance Agent. Your job is to review the sourcing approach for a proposed data collection action.
@@ -190,14 +190,15 @@ async def compliance_node(state: DataCrawlState) -> dict:
             "messages": [AIMessage(content=f"[Compliance Result]: {json.dumps(result)}", name="compliance")],
         }
     except Exception as exc:
+        error_detail = describe_exception(exc)
         finish_agent_log(
             state["user_id"],
             state["project_id"],
             state["run_id"],
             log_id=log_id,
             status="failed",
-            summary=f"Compliance check failed: {exc}",
-            details={"error": str(exc)},
+            summary=f"Source review failed: {error_detail}",
+            details={"error": error_detail, "error_type": type(exc).__name__},
             clear_current_task=True,
         )
         raise

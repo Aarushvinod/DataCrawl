@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 
 
@@ -32,6 +32,7 @@ class ProjectResponse(BaseModel):
 
 class RunCreate(BaseModel):
     initial_message: str = ""
+    generation_mode: Literal["real", "synthetic"] = "real"
 
 
 class RunMessage(BaseModel):
@@ -62,6 +63,7 @@ class RunCheckoutConfirmationRequest(BaseModel):
 class RunResponse(BaseModel):
     id: str
     status: str
+    generation_mode: str = "real"
     plan: Optional[dict] = None
     agent_logs: list[dict] = Field(default_factory=list)
     total_cost: float = 0.0
@@ -94,7 +96,8 @@ class DatasetResponse(BaseModel):
     size_bytes: int = 0
     row_count: int = 0
     columns: list[str] = []
-    lineage: dict = {}
+    lineage: dict = Field(default_factory=dict)
+    preview_rows: list[dict] = Field(default_factory=list)
     source_type: str
     version: int = 1
     created_at: Optional[str] = None
@@ -114,11 +117,40 @@ class SetupIntentResponse(BaseModel):
 
 class PaymentMethodResponse(BaseModel):
     id: str
+    type: Literal["stripe_card", "solana_wallet"] = "stripe_card"
     brand: str
     last4: str
-    exp_month: int
-    exp_year: int
+    exp_month: Optional[int] = None
+    exp_year: Optional[int] = None
     is_default: bool = False
+    label: Optional[str] = None
+    wallet_address: Optional[str] = None
+    network: Optional[str] = None
+    asset: Optional[str] = None
+    provider: Optional[str] = None
+
+
+class SolanaWalletChallengeRequest(BaseModel):
+    address: str = Field(..., min_length=32)
+    label: str = Field(default="", max_length=120)
+
+
+class SolanaWalletChallengeResponse(BaseModel):
+    challenge_id: str
+    message: str
+    expires_at: str
+
+
+class SolanaWalletSaveRequest(BaseModel):
+    challenge_id: str = Field(..., min_length=1)
+    address: str = Field(..., min_length=32)
+    signature_base64: str = Field(..., min_length=1)
+    label: str = Field(default="", max_length=120)
+
+
+class RunSolanaPaymentConfirmationRequest(BaseModel):
+    request_id: str = Field(..., min_length=1)
+    signature: str = Field(..., min_length=1)
 
 
 class SavedPaymentMethodSummary(BaseModel):

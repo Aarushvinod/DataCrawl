@@ -1,6 +1,8 @@
-import { useMemo, useState } from 'react';
 import { KeyRound, LockKeyhole, Mail, ShieldCheck } from 'lucide-react';
-import api from '../../services/api';
+import { useMemo, useState } from 'react';
+import api, { getApiErrorMessage } from '../../services/api';
+import ActionSpiderAccent from '../Workspace/ActionSpiderAccent';
+import SignalStrip from '../Workspace/SignalStrip';
 
 interface InputField {
   id: string;
@@ -25,9 +27,10 @@ interface RunInputRequestProps {
   runId: string;
   request: RunInputRequestPayload;
   onResolved: () => void;
+  showSpiderAccent?: boolean;
 }
 
-function fieldType(inputType?: string): string {
+function fieldType(inputType?: string) {
   switch (inputType) {
     case 'email':
       return 'email';
@@ -54,13 +57,32 @@ function fieldIcon(inputType?: string) {
   }
 }
 
-export default function RunInputRequest({ projectId, runId, request, onResolved }: RunInputRequestProps) {
-  const fields = request.fields || [];
+export default function RunInputRequest({
+  projectId,
+  runId,
+  request,
+  onResolved,
+  showSpiderAccent = true,
+}: RunInputRequestProps) {
+  const fields = useMemo(() => request.fields || [], [request.fields]);
   const [values, setValues] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
-
+  const [error, setError] = useState<string | null>(null);
   const isManualCheckoutConfirmation = request.type === 'manual_checkout_confirmation';
-  const primaryActionLabel = isManualCheckoutConfirmation ? 'I completed checkout' : 'Continue';
+  const requestSignals = [
+    {
+      label: 'Fields',
+      value: String(fields.length),
+      note: 'details requested',
+      tone: 'secondary' as const,
+    },
+    {
+      label: 'Provider',
+      value: request.provider || 'Run input',
+      note: isManualCheckoutConfirmation ? 'manual confirmation' : 'search can resume after this',
+      tone: 'primary' as const,
+    },
+  ];
 
   const missingRequired = useMemo(
     () => fields.some((field) => field.required && !values[field.id]?.trim()),
@@ -69,6 +91,7 @@ export default function RunInputRequest({ projectId, runId, request, onResolved 
 
   async function handleSubmit() {
     setSubmitting(true);
+    setError(null);
     try {
       if (isManualCheckoutConfirmation) {
         await api.post(`/api/projects/${projectId}/runs/${runId}/confirm-checkout`, {
@@ -82,81 +105,54 @@ export default function RunInputRequest({ projectId, runId, request, onResolved 
         });
       }
       onResolved();
-    } catch {
-      // Input submission failed
+    } catch (err) {
+      setError(getApiErrorMessage(err, 'Could not continue this run.'));
     } finally {
       setSubmitting(false);
     }
   }
 
   return (
-    <div
-      className="card"
-      style={{
-        margin: '12px 0',
-        borderColor: 'var(--border-color)',
-      }}
-    >
-      <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 8 }}>
-        {request.title || 'Input Required'}
+    <div className="card dc-input-card">
+      {showSpiderAccent && <ActionSpiderAccent variant="watch" className="dc-approval-card__spider" />}
+
+      <div className="dc-page-header__copy" style={{ marginBottom: 18 }}>
+        <p className="dc-section__eyebrow">More details needed</p>
+        <h2 className="dc-section__title" style={{ fontSize: '1.8rem' }}>{request.title || 'A few details are needed before the run can continue.'}</h2>
+        {request.instructions && <p className="dc-section__copy">{request.instructions}</p>}
       </div>
-      {request.instructions && (
-        <div style={{ color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6, marginBottom: 14 }}>
-          {request.instructions}
-        </div>
-      )}
+
+      <SignalStrip items={requestSignals} compact />
 
       {fields.length > 0 && (
-        <div style={{ display: 'grid', gap: 12, marginBottom: 14 }}>
+        <div className="dc-form-grid" style={{ marginBottom: 18 }}>
           {fields.map((field) => (
-            <label key={field.id} style={{ display: 'grid', gap: 6 }}>
-              <span style={{ fontSize: 13, fontWeight: 500 }}>
-                {field.label || field.id}
-              </span>
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  border: '1px solid var(--border-color)',
-                  borderRadius: 'var(--radius-md)',
-                  backgroundColor: 'var(--bg-primary)',
-                  padding: '0 12px',
-                }}
-              >
+            <label key={field.id} className="dc-form-grid">
+              <span style={{ fontSize: 13, fontWeight: 600 }}>{field.label || field.id}</span>
+              <div className="dc-info-card" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 {fieldIcon(field.input_type)}
                 <input
                   type={fieldType(field.input_type)}
                   value={values[field.id] || ''}
                   onChange={(event) => setValues((current) => ({ ...current, [field.id]: event.target.value }))}
                   placeholder={field.placeholder || ''}
-                  style={{
-                    flex: 1,
-                    height: 40,
-                    background: 'transparent',
-                    border: 'none',
-                    outline: 'none',
-                    color: 'var(--text-primary)',
-                    fontSize: 14,
-                  }}
+                  style={{ border: 'none', background: 'transparent', padding: 0 }}
                 />
               </div>
-              {field.help_text && (
-                <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                  {field.help_text}
-                </span>
-              )}
+              {field.help_text && <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>{field.help_text}</span>}
             </label>
           ))}
         </div>
       )}
 
+      {error && <div className="card" style={{ borderColor: 'rgba(255, 125, 125, 0.24)', color: 'var(--color-error)', marginBottom: 18 }}>{error}</div>}
+
       <button
         className="btn btn--primary"
-        onClick={handleSubmit}
+        onClick={() => void handleSubmit()}
         disabled={submitting || (!isManualCheckoutConfirmation && missingRequired)}
       >
-        {primaryActionLabel}
+        {isManualCheckoutConfirmation ? 'I finished checkout' : 'Continue'}
       </button>
     </div>
   );

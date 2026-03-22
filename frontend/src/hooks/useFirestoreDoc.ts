@@ -12,16 +12,15 @@ export function useFirestoreDoc<T = DocumentData>(
   documentPath: string | null
 ): UseFirestoreDocResult<T> {
   const [data, setData] = useState<T | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(Boolean(documentPath));
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
     if (!documentPath) {
-      setData(null);
-      setLoading(false);
       return;
     }
 
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
     setError(null);
 
@@ -48,6 +47,10 @@ export function useFirestoreDoc<T = DocumentData>(
 
     return () => unsubscribe();
   }, [documentPath]);
+
+  if (!documentPath) {
+    return { data: null, loading: false, error: null };
+  }
 
   return { data, loading, error };
 }

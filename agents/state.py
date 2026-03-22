@@ -28,6 +28,7 @@ def merge_datasets(existing: list[dict] | None, updates: list[dict] | None) -> l
 
 class DataCrawlState(TypedDict):
     run_id: str
+    generation_mode: str
 
     # Conversation
     messages: Annotated[list, add_messages]

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import textwrap
 import sys
 import tempfile
@@ -16,7 +17,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.services.project_secrets import materialize_secret_env
 from app.services.run_control import finish_agent_log, register_cleanup, run_cancellable, start_agent_log
-from agents.llm_utils import TOGETHER_MODELS, invoke_together
+from agents.llm_utils import TOGETHER_MODELS, describe_exception, invoke_together
 from agents.state import DataCrawlState
 
 SCRIPT_WRITER_SYSTEM_PROMPT = """You are the DataCrawl Script Writer Agent. You generate Python scripts that collect data from APIs and websites.
@@ -265,19 +266,19 @@ async def _install_script_dependencies(
         str(deps_dir),
         *packages,
     ]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         cwd=temp_dir,
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
-    register_cleanup(state["run_id"], lambda proc=process: proc.kill() if proc.returncode is None else None)
+    register_cleanup(state["run_id"], lambda proc=process: proc.kill() if proc.poll() is None else None)
     stdout_bytes, stderr_bytes = await run_cancellable(
         state["user_id"],
         state["project_id"],
         state["run_id"],
-        process.communicate(),
+        asyncio.to_thread(process.communicate),
     )
     if process.returncode != 0:
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -313,10 +314,10 @@ async def _execute_generated_script(state: DataCrawlState, script: str, task: di
     last_command: list[str] = []
     for command in commands:
         last_command = command
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=temp_dir.name,
             env={
                 **os.environ,
@@ -329,13 +330,13 @@ async def _execute_generated_script(state: DataCrawlState, script: str, task: di
                 ),
             },
         )
-        register_cleanup(state["run_id"], lambda proc=process: proc.kill() if proc.returncode is None else None)
+        register_cleanup(state["run_id"], lambda proc=process: proc.kill() if proc.poll() is None else None)
 
         stdout_bytes, stderr_bytes = await run_cancellable(
             state["user_id"],
             state["project_id"],
             state["run_id"],
-            process.communicate(),
+            asyncio.to_thread(process.communicate),
         )
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -476,27 +477,36 @@ async def script_writer_node(state: DataCrawlState) -> dict:
         script = ""
         model_used = TOGETHER_MODELS["script_writer"]
         last_finish_reason = None
+        attempt_errors: list[str] = []
 
         for model_name, extra_body in attempts:
-            response = await invoke_together(
-                state,
-                model=model_name,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=2200,
-                extra_body=extra_body,
-                log_id=log_id,
-            )
-            model_used = model_name
-            last_finish_reason = response.response_metadata.get("finish_reason")
-            raw_content = response.content if isinstance(response.content, str) else str(response.content or "")
-            script = _extract_script(raw_content)
-            if script.strip():
-                break
+            try:
+                response = await invoke_together(
+                    state,
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=2200,
+                    extra_body=extra_body,
+                    log_id=log_id,
+                )
+                model_used = model_name
+                last_finish_reason = response.response_metadata.get("finish_reason")
+                raw_content = response.content if isinstance(response.content, str) else str(response.content or "")
+                script = _extract_script(raw_content)
+                if script.strip():
+                    break
+                attempt_errors.append(
+                    f"{model_name}: returned no script (finish_reason={last_finish_reason})"
+                )
+            except Exception as exc:
+                attempt_errors.append(f"{model_name}: {describe_exception(exc)}")
+                continue
 
         if not script.strip():
             raise RuntimeError(
-                f"Script writer returned no code. Last finish_reason={last_finish_reason}, model={model_used}"
+                "Script writer returned no code. "
+                f"Attempts: {' | '.join(attempt_errors) or 'no successful response'}"
             )
 
         execution_details = {}
@@ -518,7 +528,7 @@ async def script_writer_node(state: DataCrawlState) -> dict:
                     script = working_script
                     break
                 except Exception as exc:
-                    last_failure = str(exc)
+                    last_failure = describe_exception(exc)
                     if candidate_index == len(candidate_scripts) - 1 and repair_attempt == 2:
                         raise
                     if candidate_index < len(candidate_scripts) - 1 and repair_attempt == 0:
@@ -580,14 +590,18 @@ async def script_writer_node(state: DataCrawlState) -> dict:
             "last_script_task": task,
         }
     except Exception as exc:
+        error_detail = describe_exception(exc)
         finish_agent_log(
             state["user_id"],
             state["project_id"],
             state["run_id"],
             log_id=log_id,
             status="failed",
-            summary=f"Script generation failed: {exc}",
-            details={"error": str(exc)},
+            summary=f"Script generation failed: {error_detail}",
+            details={
+                "error": error_detail,
+                "error_type": type(exc).__name__,
+            },
             clear_current_task=True,
         )
         raise

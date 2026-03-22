@@ -1,9 +1,12 @@
+import { Database, FolderOpen, Radar, Wallet } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
-import { Database, FolderOpen } from 'lucide-react';
 import type { ProjectRecord } from '../../services/normalizers';
+import ActionSpiderAccent from '../Workspace/ActionSpiderAccent';
+import ConsoleAmbientDigits from '../Workspace/ConsoleAmbientDigits';
 
 interface ProjectCardProps {
   project: ProjectRecord;
+  isCaptured?: boolean;
 }
 
 function statusBadgeClass(status: string): string {
@@ -19,7 +22,7 @@ function statusBadgeClass(status: string): string {
   }
 }
 
-export default function ProjectCard({ project }: ProjectCardProps) {
+export default function ProjectCard({ project, isCaptured = false }: ProjectCardProps) {
   const navigate = useNavigate();
   const budgetPct = project.budget > 0
     ? Math.min((project.budget_spent / project.budget) * 100, 100)
@@ -30,97 +33,74 @@ export default function ProjectCard({ project }: ProjectCardProps) {
       ? 'var(--color-error)'
       : budgetPct > 70
         ? 'var(--color-warning)'
-        : 'var(--accent-blue)';
+        : 'var(--accent-primary)';
 
   return (
     <div
-      className="card"
+      className={`card dc-project-card${isCaptured ? ' is-captured' : ''}`}
       onClick={() => navigate(`/projects/${project.id}`)}
-      style={{
-        cursor: 'pointer',
-        transition: 'border-color 0.15s',
-      }}
-      onMouseEnter={(e) => {
-        (e.currentTarget as HTMLDivElement).style.borderColor = 'var(--accent-blue)';
-      }}
-      onMouseLeave={(e) => {
-        (e.currentTarget as HTMLDivElement).style.borderColor = 'var(--border-color)';
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          navigate(`/projects/${project.id}`);
+        }
       }}
     >
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          marginBottom: 8,
-        }}
-      >
-        <h3 style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)' }}>
-          {project.name}
-        </h3>
+      <ConsoleAmbientDigits variant="card" tone={project.status === 'running' ? 'primary' : 'mixed'} className="dc-project-card__ambient" />
+      {isCaptured && <ActionSpiderAccent variant="capture" className="dc-project-card__spider" />}
+
+      <div className="dc-project-card__top">
+        <div>
+          <h3 className="dc-project-card__title">{project.name}</h3>
+          <div className="dc-run-mode" style={{ marginTop: 6 }}>Workspace #{project.id.slice(0, 8)}</div>
+        </div>
         <span className={statusBadgeClass(project.status)}>{project.status}</span>
       </div>
 
-      <p
-        style={{
-          fontSize: 13,
-          color: 'var(--text-secondary)',
-          marginBottom: 16,
-          lineHeight: 1.5,
-          display: '-webkit-box',
-          WebkitLineClamp: 2,
-          WebkitBoxOrient: 'vertical',
-          overflow: 'hidden',
-        }}
-      >
-        {project.description}
-      </p>
+      <div className="dc-project-card__body">
+        <p style={{ margin: 0, color: 'var(--text-secondary)' }}>
+          {project.description || 'Use this project to track crawl runs, synthetic generation, and dataset revisions over time.'}
+        </p>
 
-      {/* Budget meter */}
-      <div style={{ marginBottom: 12 }}>
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            fontSize: 12,
-            color: 'var(--text-secondary)',
-            marginBottom: 4,
-          }}
-        >
-          <span>Budget</span>
-          <span className="mono">
-            ${project.budget_spent.toFixed(2)} / ${project.budget.toFixed(2)}
-          </span>
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
+            <span>Budget in motion</span>
+            <span className="mono">{`$${project.budget_spent.toFixed(2)} / $${project.budget.toFixed(2)}`}</span>
+          </div>
+          <div className="budget-meter">
+            <div
+              className="budget-meter__fill"
+              style={{
+                width: `${budgetPct}%`,
+                backgroundColor: budgetColor,
+              }}
+            />
+          </div>
         </div>
-        <div className="budget-meter">
-          <div
-            className="budget-meter__fill"
-            style={{
-              width: `${budgetPct}%`,
-              backgroundColor: budgetColor,
-            }}
-          />
+
+        <div className="dc-project-card__signal-grid">
+          <div className="dc-project-card__signal">
+            <span className="dc-project-card__signal-label">Search status</span>
+            <strong>{project.status}</strong>
+          </div>
+          <div className="dc-project-card__signal">
+            <span className="dc-project-card__signal-label">Saved outputs</span>
+            <strong>{project.dataset_count}</strong>
+          </div>
+          <div className="dc-project-card__signal">
+            <span className="dc-project-card__signal-label">Budget used</span>
+            <strong>{budgetPct.toFixed(0)}%</strong>
+          </div>
         </div>
       </div>
 
-      {/* Footer */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 16,
-          fontSize: 12,
-          color: 'var(--text-secondary)',
-        }}
-      >
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <Database size={14} />
-          {project.dataset_count} dataset{project.dataset_count !== 1 ? 's' : ''}
-        </span>
-        <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-          <FolderOpen size={14} />
-          {project.id.slice(0, 8)}
-        </span>
+      <div className="dc-project-card__footer">
+        <span className="dc-tag"><Database size={14} /> {project.dataset_count} capture{project.dataset_count === 1 ? '' : 's'}</span>
+        <span className="dc-tag"><Wallet size={14} /> {budgetPct.toFixed(0)}% budget used</span>
+        <span className="dc-tag"><Radar size={14} /> Search room ready</span>
+        <span className="dc-tag"><FolderOpen size={14} /> Open project</span>
       </div>
     </div>
   );

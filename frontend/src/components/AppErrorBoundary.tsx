@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
+import BrandWordmark from './Brand/BrandWordmark';
 
 interface AppErrorBoundaryProps {
   children: ReactNode;
@@ -32,40 +33,16 @@ export default class AppErrorBoundary extends Component<
   render() {
     if (this.state.hasError) {
       return (
-        <div
-          style={{
-            minHeight: '100vh',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            padding: 24,
-            backgroundColor: 'var(--bg-primary)',
-            color: 'var(--text-primary)',
-          }}
-        >
-          <div
-            className="card"
-            style={{
-              maxWidth: 520,
-              width: '100%',
-              textAlign: 'center',
-            }}
-          >
-            <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 12 }}>
-              Something went wrong
-            </h1>
-            <p
-              style={{
-                color: 'var(--text-secondary)',
-                marginBottom: 20,
-                lineHeight: 1.5,
-              }}
-            >
-              The page hit an unexpected frontend error. Reload the app to recover.
+        <div className="dc-loading-screen" style={{ padding: 24 }}>
+          <div className="card" style={{ maxWidth: 560, width: '100%', textAlign: 'center' }}>
+            <div style={{ marginBottom: 18 }}>
+              <BrandWordmark size="section" />
+            </div>
+            <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>Something went wrong</h1>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: 20, lineHeight: 1.6 }}>
+              The page hit an unexpected frontend error. Reload the app to get back to the workspace.
             </p>
-            <button className="btn btn--primary" onClick={this.handleReset}>
-              Reload App
-            </button>
+            <button className="btn btn--primary" onClick={this.handleReset}>Reload app</button>
           </div>
         </div>
       );

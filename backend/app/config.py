@@ -28,6 +28,13 @@ class Settings:
     STRIPE_PUBLISHABLE_KEY: str = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
     STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
+    # Solana
+    SOLANA_RPC_URL: str = os.getenv("SOLANA_RPC_URL", "")
+    SOLANA_NETWORK: str = os.getenv("SOLANA_NETWORK", "devnet")
+    SOLANA_USDC_MINT: str = os.getenv("SOLANA_USDC_MINT", "")
+    SOLANA_CONFIRMATION_LEVEL: str = os.getenv("SOLANA_CONFIRMATION_LEVEL", "confirmed")
+    SOLANA_PAYMENT_REQUEST_TTL_SECONDS: int = int(os.getenv("SOLANA_PAYMENT_REQUEST_TTL_SECONDS", "900"))
+
     # Frontend URL (for CORS)
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
 

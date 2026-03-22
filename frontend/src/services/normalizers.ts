@@ -23,6 +23,7 @@ export interface ApiRunSummary {
   id: string;
   name?: string | null;
   status?: string | null;
+  generation_mode?: string | null;
   started_at?: string | null;
   created_at?: string | null;
   duration_seconds?: number | null;
@@ -34,6 +35,7 @@ export interface RunSummary {
   id: string;
   name: string;
   status: string;
+  generation_mode: string;
   created_at: string;
   duration_seconds?: number;
   cost?: number;
@@ -64,6 +66,7 @@ export function normalizeRunSummary(run: ApiRunSummary): RunSummary {
     id: run.id,
     name: run.name || `Run ${run.id.slice(0, 8)}`,
     status: run.status || 'pending',
+    generation_mode: run.generation_mode || 'real',
     created_at: run.created_at || run.started_at || '',
     duration_seconds: toOptionalNumber(run.duration_seconds),
     cost: toOptionalNumber(run.cost ?? run.total_cost),

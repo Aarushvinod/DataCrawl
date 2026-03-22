@@ -34,7 +34,9 @@ async def list_payment_methods(customer_id: str) -> list[dict]:
     )
     return [
         {
-            "id": pm.id,
+            "id": f"stripe:{pm.id}",
+            "provider": "stripe",
+            "type": "stripe_card",
             "brand": pm.card.brand,
             "last4": pm.card.last4,
             "exp_month": pm.card.exp_month,
@@ -52,8 +54,15 @@ async def detach_payment_method(payment_method_id: str) -> bool:
 
 
 async def validate_payment_method_for_customer(customer_id: str, payment_method_id: str) -> dict:
+    normalized_id = payment_method_id.split(":", 1)[1] if payment_method_id.startswith("stripe:") else payment_method_id
     methods = await list_payment_methods(customer_id)
-    match = next((method for method in methods if method["id"] == payment_method_id), None)
+    match = next(
+        (
+            method for method in methods
+            if method["id"] == payment_method_id or method["id"] == f"stripe:{normalized_id}"
+        ),
+        None,
+    )
     if not match:
         raise ValueError("Selected payment method does not belong to this user.")
     return match

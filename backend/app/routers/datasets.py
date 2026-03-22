@@ -1,4 +1,6 @@
 import uuid
+import csv
+import io
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
@@ -18,6 +20,38 @@ def _datasets_col(user_id: str, project_id: str):
     )
 
 
+def _preview_rows_from_blob(storage_path: str, file_format: str) -> list[dict]:
+    bucket = get_storage_bucket()
+    blob = bucket.blob(storage_path)
+    if not blob.exists():
+        return []
+
+    try:
+        text = blob.download_as_text()
+    except Exception:
+        return []
+
+    if file_format == "json":
+        try:
+            import json
+            payload = json.loads(text)
+            if isinstance(payload, list):
+                return [item for item in payload[:100] if isinstance(item, dict)]
+            if isinstance(payload, dict):
+                rows = payload.get("rows")
+                if isinstance(rows, list):
+                    return [item for item in rows[:100] if isinstance(item, dict)]
+        except Exception:
+            return []
+        return []
+
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        return [row for _, row in zip(range(100), reader)]
+    except Exception:
+        return []
+
+
 @router.get("/{project_id}/datasets", response_model=list[DatasetResponse])
 async def list_datasets(project_id: str, user_id: str = Depends(get_user_id)):
     col = _datasets_col(user_id, project_id)
@@ -33,6 +67,7 @@ async def list_datasets(project_id: str, user_id: str = Depends(get_user_id)):
             row_count=d.get("row_count", 0),
             columns=d.get("columns", []),
             lineage=d.get("lineage", {}),
+            preview_rows=[],
             source_type=d.get("source_type", "unknown"),
             version=d.get("version", 1),
             created_at=str(d.get("created_at", "")),
@@ -46,6 +81,10 @@ async def get_dataset(project_id: str, dataset_id: str, user_id: str = Depends(g
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Dataset not found")
     d = doc.to_dict()
+    preview_rows = _preview_rows_from_blob(
+        d.get("storage_path", ""),
+        d.get("format", "csv"),
+    ) if d.get("storage_path") else []
     return DatasetResponse(
         id=doc.id,
         name=d.get("name", ""),
@@ -54,6 +93,7 @@ async def get_dataset(project_id: str, dataset_id: str, user_id: str = Depends(g
         row_count=d.get("row_count", 0),
         columns=d.get("columns", []),
         lineage=d.get("lineage", {}),
+        preview_rows=preview_rows,
         source_type=d.get("source_type", "unknown"),
         version=d.get("version", 1),
         created_at=str(d.get("created_at", "")),
@@ -143,6 +183,7 @@ async def upload_dataset(
         row_count=row_count,
         columns=columns,
         lineage=data["lineage"],
+        preview_rows=[],
         source_type="uploaded",
         version=1,
     )

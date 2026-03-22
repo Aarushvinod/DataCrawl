@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.config import settings
 from app.services.run_control import finish_agent_log, run_cancellable, start_agent_log
-from agents.llm_utils import LLMServiceError
+from agents.llm_utils import LLMServiceError, describe_exception
 from agents.state import DataCrawlState
 
 ORCHESTRATOR_MODEL = "gemini-3.1-pro-preview"
@@ -53,6 +53,13 @@ During planning, gather or infer:
 - which sources can realistically satisfy the request
 - all account, API-key, and payment prerequisites
 - the exact external-cost budget and whether it is sufficient
+
+## Handling Changed Instructions
+- Users are allowed to change their mind at any point.
+- Treat the latest user instruction as an override whenever it directly conflicts with an earlier target, such as row count, symbols, entities, time range, source choice, or budget.
+- Treat the latest user instruction as supplementary only when it adds detail without contradicting the current plan.
+- If a newer instruction overrides an earlier requirement, stop optimizing for the superseded target immediately. Do not continue planning or executing toward the old row count, source, schema, or scope.
+- When an earlier approved plan is no longer aligned with the latest user instruction, rebuild the plan from the new intent before continuing.
 
 You MAY call compliance and web_crawler during planning to verify source feasibility, auth requirements, pricing, and live provider details before proposing the plan.
 
@@ -126,6 +133,15 @@ If any paid provider may be necessary, include:
   }
 }
 
+If a provider can be settled with a verifiable USDC-on-Solana payment, you may include Solana alongside Stripe:
+- set `supported_payment_methods` to include `"solana"`
+- include `solana_payment_request` with at least:
+  - `recipient`
+  - `amount`
+  - optionally `network`, `mint`, `memo`, `reference`, `label`, and `message`
+- only include Solana when that provider step can actually be resumed after a verifiable wallet payment
+- if the provider only supports a manual card checkout, leave Solana out
+
 When you have enough information, call `present_plan`.
 
 ## Execution Phase
@@ -135,6 +151,8 @@ During execution:
 - Use free sources whenever possible. Paid providers are a last resort.
 - Before any paid provider signup or purchase step, request an explicit paid approval.
 - If validator failure occurs, retry script_writer with structured repair context up to two times before pausing for user help.
+- If synthetic generation or validation reveals that the current target is no longer aligned with the latest user instruction, update the execution path to match the new target instead of repeating the old one.
+- Do not repeat the same failing generation or validation loop for the same plan step without materially changing the scope, method, or target.
 - If a service needs account info, API keys, OTPs, or credentials, request structured user input and pause.
 
 ## Important
@@ -149,7 +167,7 @@ During execution:
 """
 
 
-def _build_tools() -> list[types.Tool]:
+def _build_tools(generation_mode: str = "real") -> list[types.Tool]:
     declarations = [
         types.FunctionDeclaration(
             name="call_compliance",
@@ -201,26 +219,6 @@ def _build_tools() -> list[types.Tool]:
                     "plan_step_id": {"type": "string"},
                 },
                 "required": ["source", "target_data"],
-            },
-        ),
-        types.FunctionDeclaration(
-            name="call_web_crawler",
-            description="Use browser automation for provider reconnaissance, account setup, API-key retrieval, or browser-based extraction.",
-            parameters_json_schema={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "mode": {"type": "string", "enum": ["recon", "account_setup", "extract"]},
-                    "provider": {"type": "string"},
-                    "goal": {"type": "string"},
-                    "auth_goal": {"type": "string"},
-                    "task_description": {"type": "string"},
-                    "extract_schema": {"type": "object"},
-                    "required_user_inputs": {"type": "array", "items": {"type": "object"}},
-                    "paid_context": {"type": "object"},
-                    "plan_step_id": {"type": "string"},
-                },
-                "required": ["url", "task_description"],
             },
         ),
         types.FunctionDeclaration(
@@ -285,7 +283,7 @@ def _build_tools() -> list[types.Tool]:
         ),
         types.FunctionDeclaration(
             name="request_paid_approval",
-            description="Pause the run before a paid-provider step and request explicit user approval with the exact live price and manual checkout requirement.",
+            description="Pause the run before a paid-provider step and request explicit user approval with the exact live price and compatible payment methods such as Stripe or verifiable USDC on Solana.",
             parameters_json_schema={
                 "type": "object",
                 "properties": {
@@ -314,6 +312,30 @@ def _build_tools() -> list[types.Tool]:
             },
         ),
     ]
+    if generation_mode != "synthetic":
+        declarations.insert(
+            2,
+            types.FunctionDeclaration(
+                name="call_web_crawler",
+                description="Use browser automation for provider reconnaissance, account setup, API-key retrieval, or browser-based extraction.",
+                parameters_json_schema={
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["recon", "account_setup", "extract"]},
+                        "provider": {"type": "string"},
+                        "goal": {"type": "string"},
+                        "auth_goal": {"type": "string"},
+                        "task_description": {"type": "string"},
+                        "extract_schema": {"type": "object"},
+                        "required_user_inputs": {"type": "array", "items": {"type": "object"}},
+                        "paid_context": {"type": "object"},
+                        "plan_step_id": {"type": "string"},
+                    },
+                    "required": ["url", "task_description"],
+                },
+            ),
+        )
     return [types.Tool(function_declarations=declarations)]
 
 
@@ -488,7 +510,12 @@ def _extract_tool_call(response: AIMessage) -> tuple[str | None, dict[str, Any] 
     return tool_call["name"], tool_call["args"]
 
 
-async def _invoke_gemini(state: DataCrawlState, contents: list[types.Content], system_instruction: str) -> Any:
+async def _invoke_gemini(
+    state: DataCrawlState,
+    contents: list[types.Content],
+    system_instruction: str,
+    generation_mode: str,
+) -> Any:
     if not settings.GOOGLE_API_KEY:
         raise LLMServiceError(
             provider="gemini",
@@ -510,7 +537,7 @@ async def _invoke_gemini(state: DataCrawlState, contents: list[types.Content], s
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         temperature=0.7,
-                        tools=_build_tools(),
+                        tools=_build_tools(generation_mode),
                         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                     ),
                 ),
@@ -522,11 +549,12 @@ async def _invoke_gemini(state: DataCrawlState, contents: list[types.Content], s
             provider="gemini",
             model=ORCHESTRATOR_MODEL,
             reason="provider_error",
-            detail=str(exc),
+            detail=describe_exception(exc),
         ) from exc
 
 
 async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
+    generation_mode = state.get("generation_mode", "real")
     plan_json = json.dumps(state.get("plan") or {}, default=str)
     latest_validation_json = json.dumps(state.get("last_validation_result") or {}, default=str)
     latest_script_json = json.dumps(state.get("last_script_task") or {}, default=str)
@@ -534,6 +562,7 @@ async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
     source_research_json = json.dumps(state.get("source_research") or [], default=str)
     budget_ctx = (
         f"\n\nProject context:\n"
+        f"- generation_mode: {generation_mode}\n"
         f"- External-cost budget: ${state.get('budget_total', 0):.2f}\n"
         f"- External costs spent so far: ${state.get('budget_spent', 0):.2f}\n"
         f"- plan_approved: {state.get('plan_approved', False)}\n"
@@ -544,6 +573,13 @@ async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
         f"- retry_counters: {retry_json}\n"
         f"- source_research: {source_research_json}"
     )
+    mode_ctx = (
+        "\n\nRun guidance:\n"
+        "- This is a synthetic-data run.\n"
+        "- Treat the request as creating synthetic financial data, not collecting live web data.\n"
+        "- Do not call the web_crawler agent or propose browser-based collection.\n"
+        "- Keep the workflow similar to a normal run, but center the plan on synthetic generation, validation, and any needed cleanup.\n"
+    ) if generation_mode == "synthetic" else ""
 
     contents: list[types.Content] = []
     for message in state.get("messages", []):
@@ -565,7 +601,8 @@ async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
         sdk_response = await _invoke_gemini(
             state,
             contents,
-            f"{ORCHESTRATOR_SYSTEM_PROMPT}{budget_ctx}",
+            f"{ORCHESTRATOR_SYSTEM_PROMPT}{mode_ctx}{budget_ctx}",
+            generation_mode,
         )
         response = _response_to_ai_message(sdk_response)
         tool_name, tool_args = _extract_tool_call(response)
@@ -630,6 +667,14 @@ async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
                 approval_payload["request_id"] = str(uuid.uuid4())
             approval_payload.setdefault("resume_phase", "execution")
             approval_payload.setdefault("requires_manual_checkout", True)
+            supported_methods = [
+                str(item).strip().lower()
+                for item in (approval_payload.get("supported_payment_methods") or ["stripe"])
+                if str(item).strip()
+            ]
+            if approval_payload.get("solana_payment_request") and "solana" not in supported_methods:
+                supported_methods.append("solana")
+            approval_payload["supported_payment_methods"] = supported_methods or ["stripe"]
             summary = (tool_args or {}).get("summary") or response.content or "A paid provider requires your approval before execution can continue."
             finish_agent_log(
                 state["user_id"],
@@ -711,14 +756,15 @@ async def orchestrator_node(state: DataCrawlState) -> dict[str, Any]:
             "current_task": None,
         }
     except Exception as exc:
+        error_detail = describe_exception(exc)
         finish_agent_log(
             state["user_id"],
             state["project_id"],
             state["run_id"],
             log_id=log_id,
             status="failed",
-            summary=f"Orchestrator failed: {exc}",
-            details={"error": str(exc)},
+            summary=f"Planning assistant failed: {error_detail}",
+            details={"error": error_detail, "error_type": type(exc).__name__},
             clear_current_task=True,
         )
         raise

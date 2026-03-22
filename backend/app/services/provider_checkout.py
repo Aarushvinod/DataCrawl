@@ -57,7 +57,13 @@ def build_paid_approval_payload(
     planned_price: Any = None,
     payment_unlocks: str = "",
     requires_manual_checkout: bool = True,
+    supported_payment_methods: list[str] | None = None,
+    solana_payment_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    methods = [str(item).strip().lower() for item in (supported_payment_methods or ["stripe"]) if str(item).strip()]
+    if solana_payment_request and "solana" not in methods:
+        methods.append("solana")
+
     return {
         "request_id": str(uuid.uuid4()),
         "provider": provider,
@@ -68,6 +74,7 @@ def build_paid_approval_payload(
         "payment_unlocks": payment_unlocks,
         "free_alternatives": free_alternatives,
         "payment_methods": payment_methods,
-        "supported_payment_methods": ["stripe"],
+        "supported_payment_methods": methods or ["stripe"],
+        "solana_payment_request": solana_payment_request,
         "requires_manual_checkout": requires_manual_checkout,
     }

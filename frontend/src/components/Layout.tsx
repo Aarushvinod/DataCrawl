@@ -1,151 +1,81 @@
-import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth0 } from '@auth0/auth0-react';
-import {
-  Database,
-  CreditCard,
-  LayoutDashboard,
-  LogOut,
-  User,
-} from 'lucide-react';
+import { CreditCard, LogOut, LayoutDashboard, User } from 'lucide-react';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
+import BrandWordmark from './Brand/BrandWordmark';
+import ConsoleAmbientDigits from './Workspace/ConsoleAmbientDigits';
 
 const navItems = [
-  { to: '/', label: 'Dashboard', icon: LayoutDashboard },
+  { to: '/projects', label: 'Projects', icon: LayoutDashboard },
   { to: '/billing', label: 'Billing', icon: CreditCard },
 ];
 
 export default function Layout() {
   const { user, logout } = useAuth0();
+  const location = useLocation();
 
   return (
-    <div style={{ display: 'flex', height: '100vh' }}>
-      <aside
-        style={{
-          width: 'var(--sidebar-width)',
-          minWidth: 'var(--sidebar-width)',
-          backgroundColor: 'var(--bg-surface)',
-          borderRight: '1px solid var(--border-color)',
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-      >
-        {/* Logo */}
-        <div
-          style={{
-            padding: '20px 16px',
-            borderBottom: '1px solid var(--border-color)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-          }}
-        >
-          <Database size={22} color="var(--accent-blue)" />
-          <span
-            style={{
-              fontSize: 18,
-              fontWeight: 700,
-              color: 'var(--text-primary)',
-            }}
-          >
-            DataCrawl
-          </span>
+    <div className="dc-shell">
+      <aside className="dc-shell__sidebar">
+        <ConsoleAmbientDigits variant="rail" tone="mixed" className="dc-shell__sidebar-ambient" />
+
+        <NavLink to="/projects" className="dc-shell__brand">
+          <div className="dc-shell__brand-copy">
+            <BrandWordmark size="nav" />
+            <span className="dc-shell__brand-subtitle">Financial crawl console</span>
+          </div>
+          <span className="dc-shell__brand-mark" />
+        </NavLink>
+
+        <div className="dc-shell__signal-ribbon">
+          <span>Search routes</span>
+          <span>Market signals</span>
+          <span>Captured data</span>
         </div>
 
-        {/* Navigation */}
-        <nav style={{ flex: 1, padding: '12px 8px' }}>
+        <nav className="dc-shell__nav">
           {navItems.map((item) => (
             <NavLink
               key={item.to}
               to={item.to}
-              end={item.to === '/'}
-              style={({ isActive }) => ({
-                display: 'flex',
-                alignItems: 'center',
-                gap: 10,
-                padding: '10px 12px',
-                borderRadius: 'var(--radius-md)',
-                color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
-                backgroundColor: isActive ? 'var(--bg-elevated)' : 'transparent',
-                textDecoration: 'none',
-                fontSize: 14,
-                fontWeight: isActive ? 500 : 400,
-                marginBottom: 2,
-                transition: 'background-color 0.15s, color 0.15s',
-              })}
+              end={item.to === '/projects'}
+              className={({ isActive }) => `dc-shell__nav-link${isActive ? ' is-active' : ''}`}
             >
               <item.icon size={18} />
-              {item.label}
+              <span>{item.label}</span>
             </NavLink>
           ))}
         </nav>
 
-        {/* User info */}
-        <div
-          style={{
-            padding: '12px 16px',
-            borderTop: '1px solid var(--border-color)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-          }}
-        >
+        <div className="dc-shell__footer">
           {user?.picture ? (
-            <img
-              src={user.picture}
-              alt=""
-              style={{
-                width: 32,
-                height: 32,
-                borderRadius: '50%',
-              }}
-            />
+            <img className="dc-shell__avatar" src={user.picture} alt="" />
           ) : (
-            <User size={20} color="var(--text-secondary)" />
+            <div className="dc-shell__avatar dc-shell__avatar-fallback">
+              <User size={18} />
+            </div>
           )}
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div
-              style={{
-                fontSize: 13,
-                fontWeight: 500,
-                color: 'var(--text-primary)',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              {user?.name || 'User'}
-            </div>
-            <div
-              style={{
-                fontSize: 12,
-                color: 'var(--text-secondary)',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              {user?.email || ''}
-            </div>
+
+          <div className="dc-shell__footer-copy">
+            <div className="dc-shell__footer-name">{user?.name || 'DataCrawl user'}</div>
+            <div className="dc-shell__footer-email">{user?.email || ''}</div>
           </div>
+
           <button
             className="btn btn--ghost"
             onClick={() => logout({ logoutParams: { returnTo: window.location.origin } })}
             title="Log out"
-            style={{ padding: 6 }}
+            style={{ paddingInline: 12 }}
           >
             <LogOut size={16} />
           </button>
         </div>
       </aside>
 
-      {/* Main content */}
-      <main
-        style={{
-          flex: 1,
-          overflow: 'auto',
-          padding: '24px 32px',
-        }}
-      >
-        <Outlet />
+      <main className="dc-shell__main">
+        <div key={location.pathname} className="dc-shell__thread is-active" />
+        <div className="dc-shell__main-inner">
+          <Outlet />
+        </div>
       </main>
     </div>
   );

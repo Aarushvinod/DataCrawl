@@ -23,6 +23,104 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _finalize_running_logs(logs: list[dict[str, Any]] | None, terminal_status: str) -> list[dict[str, Any]]:
+    current_logs = list(logs or [])
+    if not current_logs:
+        return current_logs
+
+    finished_at = utc_now_iso()
+    finalized_logs: list[dict[str, Any]] = []
+    for entry in current_logs:
+        updated_entry = dict(entry)
+        if updated_entry.get("status") == "running":
+            updated_entry["status"] = terminal_status
+            updated_entry["completed_at"] = finished_at
+            start_time = updated_entry.get("started_at")
+            if start_time:
+                try:
+                    started = datetime.fromisoformat(start_time)
+                    completed = datetime.fromisoformat(finished_at)
+                    updated_entry["duration_seconds"] = max(0, int((completed - started).total_seconds()))
+                except Exception:
+                    pass
+        finalized_logs.append(updated_entry)
+
+    return finalized_logs
+
+
+def build_planning_reset_state(
+    *,
+    budget_total: float | None = None,
+    generation_mode: str | None = None,
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {
+        "status": "planning",
+        "current_phase": "planning",
+        "plan": None,
+        "plan_approved": False,
+        "current_agent": "",
+        "current_task": None,
+        "pending_input_request": None,
+        "pending_paid_approval": None,
+        "budget_analysis": None,
+        "active_plan_step_id": None,
+        "retry_counters": {},
+        "source_research": [],
+        "last_script_task": None,
+        "last_validation_result": None,
+        "completed_steps": 0,
+        "total_steps": 0,
+        "error": None,
+    }
+    if budget_total is not None:
+        updates["budget_total"] = budget_total
+    if generation_mode is not None:
+        updates["generation_mode"] = generation_mode
+    return updates
+
+
+def build_planning_reset_updates(
+    current_doc: dict[str, Any] | None,
+    *,
+    budget_total: float | None = None,
+    progress_percent: int = 15,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    updates = build_planning_reset_state(budget_total=budget_total)
+    updates["progress_percent"] = progress_percent
+    updates["completed_at"] = completed_at
+    current_logs = list((current_doc or {}).get("agent_logs", []) or [])
+    finalized_logs = _finalize_running_logs(current_logs, "killed")
+    if finalized_logs != current_logs:
+        updates["agent_logs"] = finalized_logs
+    return updates
+
+
+def build_terminal_run_updates(
+    current_doc: dict[str, Any] | None,
+    *,
+    status: str,
+    error: str | None = None,
+    current_phase: str | None = None,
+) -> dict[str, Any]:
+    current = current_doc or {}
+    updates: dict[str, Any] = {
+        "status": status,
+        "current_phase": current_phase or status,
+        "current_agent": "",
+        "current_task": None,
+        "pending_input_request": None,
+        "pending_paid_approval": None,
+        "active_plan_step_id": None,
+        "error": error,
+    }
+    current_logs = list(current.get("agent_logs", []) or [])
+    finalized_logs = _finalize_running_logs(current_logs, status)
+    if finalized_logs != current_logs:
+        updates["agent_logs"] = finalized_logs
+    return updates
+
+
 def get_run_ref(user_id: str, project_id: str, run_id: str):
     db = get_firestore_client()
     return (

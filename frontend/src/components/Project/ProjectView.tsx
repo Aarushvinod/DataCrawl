@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Plus } from 'lucide-react';
+import { ArrowLeft, Database, Plus, Radar, Wallet } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
 import api from '../../services/api';
 import {
   normalizeProject,
@@ -10,8 +10,10 @@ import {
   type ProjectRecord,
   type RunSummary,
 } from '../../services/normalizers';
-import RunList from './RunList';
 import DatasetList from './DatasetList';
+import RunList from './RunList';
+import ConsoleAmbientDigits from '../Workspace/ConsoleAmbientDigits';
+import SignalStrip from '../Workspace/SignalStrip';
 
 interface Dataset {
   id: string;
@@ -20,6 +22,8 @@ interface Dataset {
   size_bytes: number;
   created_at: string;
   format: string;
+  source_type?: string;
+  version?: number;
 }
 
 type Tab = 'runs' | 'datasets';
@@ -35,58 +39,52 @@ export default function ProjectView() {
   const [creatingRun, setCreatingRun] = useState(false);
 
   const fetchData = useCallback(async () => {
-    if (!projectId) return;
+    if (!projectId) {
+      return;
+    }
+
     try {
       setLoading(true);
-      const [proj, runList, datasetList] = await Promise.all([
+      const [projectResponse, runList, datasetList] = await Promise.all([
         api.get<ApiProject>(`/api/projects/${projectId}`),
         api.get<ApiRunSummary[]>(`/api/projects/${projectId}/runs`),
         api.get<Dataset[]>(`/api/projects/${projectId}/datasets`),
       ]);
-      setProject(normalizeProject(proj));
+      setProject(normalizeProject(projectResponse));
       setRuns(runList.map(normalizeRunSummary));
       setDatasets(datasetList);
-    } catch {
-      // Fetch error
     } finally {
       setLoading(false);
     }
   }, [projectId]);
 
   useEffect(() => {
-    fetchData();
+    void fetchData();
   }, [fetchData]);
 
-  async function handleNewRun() {
-    if (!projectId || !project) return;
+  async function handleNewRun(generationMode: 'real' | 'synthetic') {
+    if (!projectId) {
+      return;
+    }
 
     setCreatingRun(true);
     try {
       const run = await api.post<ApiRunSummary>(`/api/projects/${projectId}/runs`, {
         initial_message: '',
+        generation_mode: generationMode,
       });
       navigate(`/projects/${projectId}/runs/${run.id}`);
-    } catch {
-      // Create run failed
     } finally {
       setCreatingRun(false);
     }
   }
 
   if (loading) {
-    return (
-      <div style={{ color: 'var(--text-secondary)', padding: '40px 0', textAlign: 'center' }}>
-        Loading project...
-      </div>
-    );
+    return <div className="dc-empty-state"><div className="dc-empty-state__spider" /><div>Loading project...</div></div>;
   }
 
   if (!project) {
-    return (
-      <div style={{ color: 'var(--color-error)', padding: '40px 0', textAlign: 'center' }}>
-        Project not found.
-      </div>
-    );
+    return <div className="card" style={{ borderColor: 'rgba(255, 125, 125, 0.24)', color: 'var(--color-error)' }}>Project not found.</div>;
   }
 
   const budgetPct = project.budget > 0
@@ -98,103 +96,96 @@ export default function ProjectView() {
       ? 'var(--color-error)'
       : budgetPct > 70
         ? 'var(--color-warning)'
-        : 'var(--accent-blue)';
-
-  const tabStyle = (tab: Tab) => ({
-    padding: '8px 16px',
-    fontSize: 14,
-    fontWeight: activeTab === tab ? 600 : 400,
-    color: activeTab === tab ? 'var(--text-primary)' : 'var(--text-secondary)',
-    borderBottom: activeTab === tab ? '2px solid var(--accent-blue)' : '2px solid transparent',
-    background: 'none',
-    cursor: 'pointer' as const,
-    transition: 'color 0.15s',
-  });
+        : 'var(--accent-primary)';
+  const projectSignals = [
+    {
+      label: 'Crawl history',
+      value: runs.length.toLocaleString(),
+      note: 'runs recorded',
+      icon: <Radar size={12} />,
+      tone: 'primary' as const,
+    },
+    {
+      label: 'Captured outputs',
+      value: datasets.length.toLocaleString(),
+      note: 'datasets saved',
+      icon: <Database size={12} />,
+      tone: 'success' as const,
+    },
+    {
+      label: 'Budget used',
+      value: `${budgetPct.toFixed(0)}%`,
+      note: `$${project.budget_spent.toFixed(2)} spent`,
+      icon: <Wallet size={12} />,
+      tone: budgetPct > 70 ? 'warning' as const : 'secondary' as const,
+    },
+  ];
 
   return (
-    <div>
-      {/* Back button */}
-      <button
-        className="btn btn--ghost"
-        onClick={() => navigate('/')}
-        style={{ marginBottom: 16, padding: '4px 0' }}
-      >
+    <div className="dc-page-stack">
+      <button className="btn btn--ghost" onClick={() => navigate('/projects')} style={{ width: 'fit-content' }}>
         <ArrowLeft size={16} />
-        Back to Projects
+        Back to projects
       </button>
 
-      {/* Project header */}
-      <div style={{ marginBottom: 24 }}>
-        <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 4 }}>{project.name}</h1>
-        <p style={{ color: 'var(--text-secondary)', fontSize: 14, marginBottom: 16 }}>
-          {project.description}
-        </p>
-
-        {/* Budget */}
-        <div style={{ maxWidth: 400 }}>
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              fontSize: 13,
-              color: 'var(--text-secondary)',
-              marginBottom: 4,
-            }}
-          >
-            <span>Budget</span>
-            <span className="mono">
-              ${project.budget_spent.toFixed(2)} / ${project.budget.toFixed(2)}
-            </span>
-          </div>
-          <div className="budget-meter" style={{ height: 8 }}>
-            <div
-              className="budget-meter__fill"
-              style={{
-                width: `${budgetPct}%`,
-                backgroundColor: budgetColor,
-              }}
-            />
+      <section className="dc-page-header dc-project-view__summary">
+        <ConsoleAmbientDigits variant="header" tone="mixed" className="dc-page-header__ambient" />
+        <div className="dc-page-header__copy">
+          <p className="dc-section__eyebrow">Project overview</p>
+          <h1 className="dc-page-header__title">{project.name}</h1>
+          <p className="dc-page-header__subtitle">
+            {project.description || 'Use this project to manage live financial crawls, synthetic scenario runs, and every revised dataset that comes out of them.'}
+          </p>
+          <SignalStrip items={projectSignals} className="dc-page-header__signals" compact />
+          <div className="dc-header-meta">
+            <span className="dc-tag">{runs.length} run{runs.length === 1 ? '' : 's'}</span>
+            <span className="dc-tag">{datasets.length} dataset{datasets.length === 1 ? '' : 's'}</span>
+            <span className="dc-tag">Status: {project.status}</span>
           </div>
         </div>
-      </div>
 
-      {/* Tabs + New Run */}
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          borderBottom: '1px solid var(--border-color)',
-          marginBottom: 16,
-        }}
-      >
-        <div style={{ display: 'flex' }}>
-          <button style={tabStyle('runs')} onClick={() => setActiveTab('runs')}>
-            Runs ({runs.length})
+        <div className="card dc-budget-card" style={{ minWidth: 300 }}>
+          <ConsoleAmbientDigits variant="card" tone="secondary" className="dc-budget-card__ambient" />
+          <div className="dc-metric-card__label">Budget monitor</div>
+          <div className="dc-metric-card__value mono">{`$${project.budget_spent.toFixed(2)} / $${project.budget.toFixed(2)}`}</div>
+          <div className="dc-metric-card__subtext">{budgetPct.toFixed(0)}% of this finance research budget has been used.</div>
+          <div className="budget-meter" style={{ marginTop: 14 }}>
+            <div className="budget-meter__fill" style={{ width: `${budgetPct}%`, backgroundColor: budgetColor }} />
+          </div>
+        </div>
+      </section>
+
+      <section className="dc-tab-bar">
+        <div className="dc-tab-buttons">
+          <button className={`dc-tab-button${activeTab === 'runs' ? ' is-active' : ''}`} onClick={() => setActiveTab('runs')}>
+            Crawl history ({runs.length})
           </button>
-          <button style={tabStyle('datasets')} onClick={() => setActiveTab('datasets')}>
-            Datasets ({datasets.length})
+          <button className={`dc-tab-button${activeTab === 'datasets' ? ' is-active' : ''}`} onClick={() => setActiveTab('datasets')}>
+            Captured outputs ({datasets.length})
           </button>
         </div>
 
         {activeTab === 'runs' && (
-          <button
-            className="btn btn--primary"
-            onClick={handleNewRun}
-            disabled={creatingRun}
-            style={{ marginBottom: 8 }}
-          >
-            <Plus size={16} />
-            {creatingRun ? 'Starting...' : 'New Run'}
-          </button>
+          <div className="dc-run-actions">
+            <button className="btn btn--primary" onClick={() => handleNewRun('real')} disabled={creatingRun}>
+              <Plus size={16} />
+              {creatingRun ? 'Starting...' : 'New market crawl'}
+            </button>
+            <button className="btn btn--secondary" onClick={() => handleNewRun('synthetic')} disabled={creatingRun}>
+              <Plus size={16} />
+              {creatingRun ? 'Starting...' : 'New synthetic build'}
+            </button>
+          </div>
         )}
-      </div>
+      </section>
 
-      {/* Tab content */}
-      {activeTab === 'runs' && <RunList projectId={project.id} runs={runs} />}
-      {activeTab === 'datasets' && (
-        <DatasetList projectId={project.id} datasets={datasets} onDeleted={fetchData} />
-      )}
+      <section className="card dc-section-card">
+        {activeTab === 'runs' ? (
+          <RunList projectId={project.id} runs={runs} onDeleted={() => void fetchData()} />
+        ) : (
+          <DatasetList projectId={project.id} datasets={datasets} onDeleted={() => void fetchData()} />
+        )}
+      </section>
     </div>
   );
 }

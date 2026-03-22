@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.services.run_control import finish_agent_log, start_agent_log
-from agents.llm_utils import TOGETHER_MODELS, invoke_together
+from agents.llm_utils import TOGETHER_MODELS, describe_exception, invoke_together
 from agents.state import DataCrawlState
 
 VALIDATOR_SYSTEM_PROMPT = """You are the DataCrawl Data Validator for financial datasets.
@@ -213,20 +213,28 @@ async def validator_node(state: DataCrawlState) -> dict:
             "current_task": None,
             "last_validation_result": result,
             "retry_counters": retry_counters,
+            "datasets": [{
+                "id": input_data.get("id", str(uuid.uuid4())) if input_data else str(uuid.uuid4()),
+                "validation_passed": passed,
+                "validation_result": result,
+                "lineage": lineage,
+                "validated_at": now,
+            }] if input_data else [],
             "messages": [AIMessage(
                 content=f"[Validation {'PASSED' if passed else 'FAILED'}]: Missing columns: {result.get('missing_columns', [])}. Unexpected columns: {result.get('unexpected_columns', [])}. Row count actual/target: {result.get('row_count_actual')} / {result.get('row_count_target')}. Blocking failures: {result.get('blocking_failures', [])}. Repair instructions: {result.get('repair_instructions', [])}",
                 name="validator",
             )],
         }
     except Exception as exc:
+        error_detail = describe_exception(exc)
         finish_agent_log(
             state["user_id"],
             state["project_id"],
             state["run_id"],
             log_id=log_id,
             status="failed",
-            summary=f"Validation failed: {exc}",
-            details={"error": str(exc)},
+            summary=f"Quality check failed: {error_detail}",
+            details={"error": error_detail, "error_type": type(exc).__name__},
             clear_current_task=True,
         )
         raise

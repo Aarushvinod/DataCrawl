@@ -52,6 +52,30 @@ export class ApiError extends Error {
   }
 }
 
+export function getApiErrorMessage(error: unknown, fallback = 'Something went wrong.') {
+  if (error instanceof ApiError) {
+    const rawBody = error.body?.trim();
+    if (rawBody) {
+      try {
+        const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+        const detail = parsed.detail ?? parsed.message ?? parsed.error;
+        if (typeof detail === 'string' && detail.trim()) {
+          return detail;
+        }
+      } catch {
+        return rawBody;
+      }
+    }
+    return error.message || fallback;
+  }
+
+  if (error instanceof Error) {
+    return error.message || fallback;
+  }
+
+  return fallback;
+}
+
 export const api = {
   async get<T = unknown>(path: string): Promise<T> {
     const headers = await getHeaders('application/json');

@@ -9,7 +9,7 @@ from langchain_together import ChatTogether
 
 from app.config import settings
 from app.services.run_control import finish_agent_log, register_cleanup, run_cancellable, start_agent_log
-from agents.llm_utils import TOGETHER_MODELS, invoke_together, require_together_api_key
+from agents.llm_utils import TOGETHER_MODELS, describe_exception, invoke_together, require_together_api_key
 from agents.state import DataCrawlState
 
 WEB_CRAWLER_SYSTEM_PROMPT = """You are the DataCrawl Web Crawler Agent for financial-data collection.
@@ -172,7 +172,7 @@ async def web_crawler_node(state: DataCrawlState) -> dict:
             )],
         }
     except Exception as e:
-        detail = str(e)
+        detail = describe_exception(e)
         if "Executable doesn't exist" in detail or "Please run the following command" in detail:
             detail = (
                 "Playwright browser binaries are not installed for browser-use. "
@@ -184,8 +184,8 @@ async def web_crawler_node(state: DataCrawlState) -> dict:
             state["run_id"],
             log_id=log_id,
             status="failed",
-            summary=f"Failed to crawl {url}: {detail}",
-            details={"error": detail},
+            summary=f"Website step failed for {url or provider or 'requested page'}: {detail}",
+            details={"error": detail, "error_type": type(e).__name__},
             clear_current_task=True,
         )
         raise RuntimeError(detail) from e
